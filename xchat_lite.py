@@ -39,6 +39,7 @@ import base64
 import binascii
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -259,12 +260,16 @@ def _signing_keys(chat: Chat, raw: Any) -> tuple[list[dict[str, str]], list[dict
     return keys, skipped
 
 
-_THRIFT_FIXED_WIDTH = {2: 1, 3: 1, 4: 8, 6: 2, 8: 4, 10: 8}
+_THRIFT_FIXED_FORMATS = {2: ">?", 3: ">b", 4: ">d", 6: ">h", 8: ">i", 10: ">q"}
 _THRIFT_STRING, _THRIFT_STRUCT, _THRIFT_MAP, _THRIFT_SET, _THRIFT_LIST = 11, 12, 13, 14, 15
 
 
 def _thrift_value(buf: bytes, pos: int, ttype: int, depth: int = 0) -> tuple[Any, int]:
-    """Read one Thrift binary value at `pos`: structs as {field id: value}, strings as bytes."""
+    """Read one Thrift binary value at `pos`.
+
+    Structs come back as {field id: value}, strings as bytes and numbers as
+    Python numbers, so a string field can be told apart from a numeric one.
+    """
     if depth > 32:
         raise ValueError("Thrift value nested too deeply")
     if ttype == _THRIFT_STRUCT:
@@ -289,36 +294,49 @@ def _thrift_value(buf: bytes, pos: int, ttype: int, depth: int = 0) -> tuple[Any
             _, pos = _thrift_value(buf, pos, key_type, depth + 1)
             _, pos = _thrift_value(buf, pos, value_type, depth + 1)
         return None, pos
-    if ttype == _THRIFT_STRING:
-        size = int.from_bytes(buf[pos : pos + 4], "big", signed=True)
-        start, end = pos + 4, pos + 4 + size
-    elif ttype in _THRIFT_FIXED_WIDTH:
-        start, end = pos, pos + _THRIFT_FIXED_WIDTH[ttype]
-    else:
+    if ttype in _THRIFT_FIXED_FORMATS:
+        fmt = _THRIFT_FIXED_FORMATS[ttype]
+        return struct.unpack_from(fmt, buf, pos)[0], pos + struct.calcsize(fmt)
+    if ttype != _THRIFT_STRING:
         raise ValueError(f"unknown Thrift type {ttype}")
+    size = int.from_bytes(buf[pos : pos + 4], "big", signed=True)
+    start, end = pos + 4, pos + 4 + size
     if end < start or end > len(buf):
         raise ValueError("truncated Thrift value")
     return buf[start:end], end
 
 
-# GroupChange variants that carry a conversation_key_version, mapped to its
-# field id: group_create, group_title_change, group_avatar_change, group_member_add.
-_GROUP_CHANGE_KEY_VERSION_FIELDS = {1: 5, 2: 2, 3: 2, 5: 6}
+# conversation_key_version field id for each MessageEventDetail variant that
+# carries one: message create, key change, Grok message, pin.
+_DETAIL_KEY_VERSION_FIELDS = {1: 101, 3: 1, 15: 5, 17: 3}
+# conversation_key_version field id for each GroupChange variant, under a group
+# change event (detail variant 4), that carries one: create, title, avatar,
+# member add, description.
+_GROUP_CHANGE_KEY_VERSION_FIELDS = {1: 5, 2: 2, 3: 2, 5: 6, 14: 2}
 
 
-def _detail_key_version(detail: dict[int, Any]) -> str:
-    """conversation_key_version of a MessageEventDetail (message, key change or group change)."""
-    message, key_change, group_change = detail.get(1), detail.get(3), detail.get(4)
-    if isinstance(message, dict):
-        return _scalar(message.get(101))
-    if isinstance(key_change, dict):
-        return _scalar(key_change.get(1))
-    change = group_change.get(1) if isinstance(group_change, dict) else None
-    if isinstance(change, dict):
-        for variant, field in _GROUP_CHANGE_KEY_VERSION_FIELDS.items():
-            if isinstance(change.get(variant), dict):
-                return _scalar(change[variant].get(field))
-    return ""
+def _union_variant(union: Any) -> tuple[int | None, dict[int, Any]]:
+    """Field id and value of a union's first field, when that field is a struct."""
+    if isinstance(union, dict) and union:
+        field_id, value = next(iter(union.items()))
+        if isinstance(value, dict):
+            return field_id, value
+    return None, {}
+
+
+def _detail_key_version(detail: Any) -> str | None:
+    """conversation_key_version carried by a MessageEventDetail, or None.
+
+    Only a string field counts, and an empty version still counts as present.
+    """
+    variant, event = _union_variant(detail)
+    if variant == 4:
+        variant, event = _union_variant(event.get(1))
+        field = _GROUP_CHANGE_KEY_VERSION_FIELDS.get(variant)
+    else:
+        field = _DETAIL_KEY_VERSION_FIELDS.get(variant)
+    version = event.get(field)
+    return version.decode("utf-8", "replace") if isinstance(version, bytes) else None
 
 
 def _event_info(event_b64: str) -> dict[str, Any] | None:
@@ -327,11 +345,11 @@ def _event_info(event_b64: str) -> dict[str, Any] | None:
     None when the payload doesn't decode.
     """
     try:
-        raw = base64.b64decode(event_b64 + "=" * (-len(event_b64) % 4))
+        raw = base64.b64decode(event_b64 + "=" * (-len(event_b64) % 4), validate=True)
         event, _ = _thrift_value(raw, 0, _THRIFT_STRUCT)
-    except (ValueError, IndexError, binascii.Error):
+    except (ValueError, IndexError, struct.error, binascii.Error):
         return None
-    detail = event.get(7) if isinstance(event.get(7), dict) else {}
+    variant, _ = _union_variant(event.get(7))
     signature = event.get(9) if isinstance(event.get(9), dict) else {}
     created_at = _scalar(event.get(6))
     return {
@@ -340,10 +358,10 @@ def _event_info(event_b64: str) -> dict[str, Any] | None:
         "sender_id": _scalar(event.get(3)),
         "conversation_id": _scalar(event.get(4)),
         "created_at_msec": int(created_at) if created_at.isdigit() else None,
-        "is_message": isinstance(detail.get(1), dict),
-        "is_key_change": isinstance(detail.get(3), dict),
+        "is_message": variant == 1,
+        "is_key_change": variant == 3,
         "signed": bool(_scalar(signature.get(1))),
-        "key_version": _detail_key_version(detail),
+        "key_version": _detail_key_version(event.get(7)),
     }
 
 
@@ -360,7 +378,7 @@ def _message_text(event: dict[str, Any]) -> str:
 
 
 def _message_status(event: dict[str, Any]) -> str:
-    if event.get("type") == "Message" and not event.get("key_version"):
+    if event.get("type") == "Message" and event.get("key_version") is None:
         return "unencrypted"
     return "verified" if event.get("verified") else "unverified"
 
@@ -388,7 +406,7 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     lenient = {
         i
         for i, info in enumerate(infos)
-        if info is not None and not info["key_version"] and not info["is_key_change"]
+        if info is not None and info["key_version"] is None and not info["is_key_change"]
     }
     strict = [i for i, event in enumerate(events) if event and i not in lenient]
     decoded: dict[int, dict[str, Any]] = {}
