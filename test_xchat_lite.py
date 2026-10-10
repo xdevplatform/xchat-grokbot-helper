@@ -353,6 +353,14 @@ class VerificationPolicyTest(unittest.TestCase):
         self.assertEqual(result["errors"], {})
         self.assertEqual(summary(result), [("GroupChange", "unverified", "")])
 
+    def test_unsigned_group_change_without_a_key_version_is_unencrypted(self):
+        event = _event(_group_change(2, _text(1, "renamed")), sender_id="333")
+        result = run_decrypt({"events": [event]})
+
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(summary(result), [("GroupChange", "unencrypted", "")])
+        self.assertEqual(result["unverified_senders"], [])
+
     def test_unencrypted_message_is_readable_and_marked(self):
         result = run_decrypt({"events": [unencrypted_message_event("sent before encryption")]})
 

@@ -450,19 +450,44 @@ def _thrift_value(buf: bytes, pos: int, ttype: int, depth: int = 0) -> tuple[Any
     return buf[start:end], end
 
 
-def _is_message_detail(detail: Any) -> bool:
-    """True when a MessageEventDetail's first field is a message create."""
-    if isinstance(detail, dict) and detail:
-        field_id, value = next(iter(detail.items()))
-        return field_id == 1 and isinstance(value, dict)
-    return False
+# conversation_key_version field id for each MessageEventDetail variant that
+# carries one: message create, key change, Grok message, pin.
+_DETAIL_KEY_VERSION_FIELDS = {1: 101, 3: 1, 15: 5, 17: 3}
+# conversation_key_version field id for each GroupChange variant, under a group
+# change event (detail variant 4), that carries one: create, title, avatar,
+# member add, description.
+_GROUP_CHANGE_KEY_VERSION_FIELDS = {1: 5, 2: 2, 3: 2, 5: 6, 14: 2}
+
+
+def _union_variant(union: Any) -> tuple[int | None, dict[int, Any]]:
+    """Field id and value of a union's first field, when that field is a struct."""
+    if isinstance(union, dict) and union:
+        field_id, value = next(iter(union.items()))
+        if isinstance(value, dict):
+            return field_id, value
+    return None, {}
+
+
+def _detail_key_version(detail: Any) -> str | None:
+    """conversation_key_version carried by a MessageEventDetail, or None.
+
+    Only a string field counts, and an empty version still counts as present,
+    matching how the X API decides whether an event is encrypted.
+    """
+    variant, event = _union_variant(detail)
+    if variant == 4:
+        variant, event = _union_variant(event.get(1))
+        field = _GROUP_CHANGE_KEY_VERSION_FIELDS.get(variant)
+    else:
+        field = _DETAIL_KEY_VERSION_FIELDS.get(variant)
+    version = event.get(field)
+    return version.decode("utf-8", "replace") if isinstance(version, bytes) else None
 
 
 def _event_info(event_b64: str) -> dict[str, Any] | None:
-    """Ids and sender of a base64 message event, or None when it doesn't decode.
+    """Ids, sender and conversation key version of a base64 message event.
 
-    Filled in only for a message that cannot be decrypted, so the placeholder
-    can still name it.
+    None when the payload doesn't decode.
     """
     try:
         raw = base64.b64decode(event_b64 + "=" * (-len(event_b64) % 4), validate=True)
@@ -470,13 +495,15 @@ def _event_info(event_b64: str) -> dict[str, Any] | None:
     except (ValueError, IndexError, struct.error, binascii.Error):
         return None
     created_at = _scalar(event.get(6))
+    variant, _ = _union_variant(event.get(7))
     return {
         "sequence_id": _scalar(event.get(1)),
         "id": _scalar(event.get(2)),
         "sender_id": _scalar(event.get(3)),
         "conversation_id": _scalar(event.get(4)),
         "created_at_msec": int(created_at) if created_at.isdigit() else None,
-        "is_message": _is_message_detail(event.get(7)),
+        "is_message": variant == 1,
+        "key_version": _detail_key_version(event.get(7)),
     }
 
 
@@ -492,8 +519,12 @@ def _message_text(event: dict[str, Any]) -> str:
     return str((event.get("content") or {}).get("text") or "")
 
 
-def _message_status(event: dict[str, Any]) -> str:
-    if event.get("type") == "Message" and event.get("key_version") is None:
+def _message_status(event: dict[str, Any], info: dict[str, Any] | None) -> str:
+    if info is not None:
+        unencrypted = info["key_version"] is None
+    else:
+        unencrypted = event.get("type") == "Message" and event.get("key_version") is None
+    if unencrypted:
         return "unencrypted"
     return "verified" if event.get("verified") else "unverified"
 
@@ -501,7 +532,7 @@ def _message_status(event: dict[str, Any]) -> str:
 def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     """Decrypt every event, whether or not its signature can be verified.
 
-    Each item has a status: verified, unencrypted (a message with no
+    Each item has a status: verified, unencrypted (an event with no
     conversation key version), or unverified. Text is included whenever
     decryption succeeded, including for an unverified event. Only an event
     that cannot be decrypted at all comes back without text.
@@ -545,7 +576,7 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     for i, event_b64 in enumerate(events):
         event = decoded.get(i)
         if event is not None:
-            status = _message_status(event)
+            status = _message_status(event, infos[i])
             sender = str(event.get("sender_id") or "")
             if status == "unverified" and sender:
                 unverified_senders.add(sender)
