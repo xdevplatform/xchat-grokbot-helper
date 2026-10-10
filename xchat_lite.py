@@ -267,8 +267,7 @@ _THRIFT_STRING, _THRIFT_STRUCT, _THRIFT_MAP, _THRIFT_SET, _THRIFT_LIST = 11, 12,
 def _thrift_value(buf: bytes, pos: int, ttype: int, depth: int = 0) -> tuple[Any, int]:
     """Read one Thrift binary value at `pos`.
 
-    Structs come back as {field id: value}, strings as bytes and numbers as
-    Python numbers, so a string field can be told apart from a numeric one.
+    Structs come back as {field id: value} and strings as bytes.
     """
     if depth > 32:
         raise ValueError("Thrift value nested too deeply")
@@ -306,51 +305,25 @@ def _thrift_value(buf: bytes, pos: int, ttype: int, depth: int = 0) -> tuple[Any
     return buf[start:end], end
 
 
-# conversation_key_version field id for each MessageEventDetail variant that
-# carries one: message create, key change, Grok message, pin.
-_DETAIL_KEY_VERSION_FIELDS = {1: 101, 3: 1, 15: 5, 17: 3}
-# conversation_key_version field id for each GroupChange variant, under a group
-# change event (detail variant 4), that carries one: create, title, avatar,
-# member add, description.
-_GROUP_CHANGE_KEY_VERSION_FIELDS = {1: 5, 2: 2, 3: 2, 5: 6, 14: 2}
-
-
-def _union_variant(union: Any) -> tuple[int | None, dict[int, Any]]:
-    """Field id and value of a union's first field, when that field is a struct."""
-    if isinstance(union, dict) and union:
-        field_id, value = next(iter(union.items()))
-        if isinstance(value, dict):
-            return field_id, value
-    return None, {}
-
-
-def _detail_key_version(detail: Any) -> str | None:
-    """conversation_key_version carried by a MessageEventDetail, or None.
-
-    Only a string field counts, and an empty version still counts as present.
-    """
-    variant, event = _union_variant(detail)
-    if variant == 4:
-        variant, event = _union_variant(event.get(1))
-        field = _GROUP_CHANGE_KEY_VERSION_FIELDS.get(variant)
-    else:
-        field = _DETAIL_KEY_VERSION_FIELDS.get(variant)
-    version = event.get(field)
-    return version.decode("utf-8", "replace") if isinstance(version, bytes) else None
+def _is_message_detail(detail: Any) -> bool:
+    """True when a MessageEventDetail's first field is a message create."""
+    if isinstance(detail, dict) and detail:
+        field_id, value = next(iter(detail.items()))
+        return field_id == 1 and isinstance(value, dict)
+    return False
 
 
 def _event_info(event_b64: str) -> dict[str, Any] | None:
-    """Ids, sender, signature and conversation key version of a base64 Thrift MessageEvent.
+    """Ids and sender of a base64 message event, or None when it doesn't decode.
 
-    None when the payload doesn't decode.
+    Filled in only for a message that cannot be decrypted, so the placeholder
+    can still name it.
     """
     try:
         raw = base64.b64decode(event_b64 + "=" * (-len(event_b64) % 4), validate=True)
         event, _ = _thrift_value(raw, 0, _THRIFT_STRUCT)
     except (ValueError, IndexError, struct.error, binascii.Error):
         return None
-    variant, _ = _union_variant(event.get(7))
-    signature = event.get(9) if isinstance(event.get(9), dict) else {}
     created_at = _scalar(event.get(6))
     return {
         "sequence_id": _scalar(event.get(1)),
@@ -358,10 +331,7 @@ def _event_info(event_b64: str) -> dict[str, Any] | None:
         "sender_id": _scalar(event.get(3)),
         "conversation_id": _scalar(event.get(4)),
         "created_at_msec": int(created_at) if created_at.isdigit() else None,
-        "is_message": variant == 1,
-        "is_key_change": variant == 3,
-        "signed": bool(_scalar(signature.get(1))),
-        "key_version": _detail_key_version(event.get(7)),
+        "is_message": _is_message_detail(event.get(7)),
     }
 
 
@@ -384,12 +354,12 @@ def _message_status(event: dict[str, Any]) -> str:
 
 
 def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
-    """Decrypt events, strictly verifying every event that names a conversation key version.
+    """Decrypt every event, whether or not its signature can be verified.
 
-    Events without one (unencrypted messages, receipts, most group changes) are
-    returned even when their sender signature can't be verified; key changes are
-    always verified. Every message gets a `status`: `verified`, `unencrypted`, or
-    `unverified` (encrypted but not verifiable, so it has no text).
+    Each item has a status: verified, unencrypted (a message with no
+    conversation key version), or unverified. Text is included whenever
+    decryption succeeded, including for an unverified event. Only an event
+    that cannot be decrypted at all comes back without text.
     """
     if isinstance(payload, list):
         payload = {"events": payload}
@@ -403,24 +373,16 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     events = [_event_b64(item) for item in raw_events]
     infos = [_event_info(event) if event else None for event in events]
     errors = {str(i): "not a base64 event" for i, event in enumerate(events) if not event}
-    lenient = {
-        i
-        for i, info in enumerate(infos)
-        if info is not None and info["key_version"] is None and not info["is_key_change"]
-    }
-    strict = [i for i, event in enumerate(events) if event and i not in lenient]
+    indices = [i for i, event in enumerate(events) if event]
     decoded: dict[int, dict[str, Any]] = {}
     conversation_keys: Any = {}
-    for indices, reject in ((strict, True), (sorted(lenient), False)):
-        if not indices:
-            continue
-        chat.set_reject_unverified(reject)
+    if indices:
+        chat.set_reject_unverified(False)
         try:
             result = chat.decrypt_events([events[i] for i in indices], signing_keys)
         finally:
             chat.set_reject_unverified(True)
-        if reject:
-            conversation_keys = result.get("conversation_keys")
+        conversation_keys = result.get("conversation_keys")
         batch_errors = result.get("errors") or {}
         by_event: dict[str, list[dict[str, Any]]] = {}
         for item in result.get("messages") or []:
@@ -436,12 +398,12 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     unverified_senders: set[str] = set()
     for i, event_b64 in enumerate(events):
-        info = infos[i] or {}
         event = decoded.get(i)
         if event is not None:
             status = _message_status(event)
-            if info.get("signed") and status == "unverified":
-                unverified_senders.add(info["sender_id"])
+            sender = str(event.get("sender_id") or "")
+            if status == "unverified" and sender:
+                unverified_senders.add(sender)
             messages.append(
                 {
                     "event": event,
@@ -451,21 +413,19 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
                 }
             )
             continue
-        error = errors.get(str(i), "")
-        if "signature" in error.lower() and info.get("sender_id"):
-            unverified_senders.add(info["sender_id"])
-        if info.get("is_message"):
-            meta = ("sequence_id", "id", "sender_id", "conversation_id", "created_at_msec")
-            messages.append(
-                {
-                    "event": {"type": "Message", **{name: info[name] for name in meta}},
-                    "text": "",
-                    "original_b64": event_b64,
-                    "status": "unverified",
-                    "error": error,
-                }
-            )
-    unverified_senders.discard("")
+        info = infos[i] or {}
+        if not info.get("is_message"):
+            continue
+        meta = ("sequence_id", "id", "sender_id", "conversation_id", "created_at_msec")
+        messages.append(
+            {
+                "event": {"type": "Message", **{name: info[name] for name in meta}},
+                "text": "",
+                "original_b64": event_b64,
+                "status": "unverified",
+                "error": errors.get(str(i), ""),
+            }
+        )
     return {
         "messages": messages,
         "conversation_keys": _normalize_conversation_keys(conversation_keys),

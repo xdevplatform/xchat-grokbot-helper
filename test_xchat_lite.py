@@ -12,7 +12,7 @@ import chat_xdk
 
 import xchat_lite
 
-STOP, BOOL, I32, STRING, STRUCT = 0, 2, 8, 11, 12
+STOP, BOOL, STRING, STRUCT = 0, 2, 11, 12
 
 # chatxdk SDK test vectors: test-only keys for user 1111, a signed self key
 # change for conversation 1111:2222 (key version 1001), and a message
@@ -95,29 +95,6 @@ def _message_event(create_event: bytes, sender_id: str, conversation_id: str) ->
     return _event(_struct(_field(STRUCT, 1, create_event)), sender_id, conversation_id)
 
 
-KEYED_DETAILS = {
-    "message": (_variant(1, _text(100, "contents"), _text(101, "1001")), "1001"),
-    "key change": (_variant(3, _text(1, "1002")), "1002"),
-    "group create": (_group_change(1, _text(3, "title"), _text(5, "1003")), "1003"),
-    "group title": (_group_change(2, _text(1, "title"), _text(2, "1004")), "1004"),
-    "group avatar": (_group_change(3, _text(1, "url"), _text(2, "1005")), "1005"),
-    "group member add": (_group_change(5, _text(4, "title"), _text(6, "1006")), "1006"),
-    "group description": (_group_change(14, _text(1, "about"), _text(2, "1007")), "1007"),
-    "grok message": (_variant(15, _text(1, "cipher"), _text(5, "1008")), "1008"),
-    "pin": (_variant(17, _text(1, "contents"), _text(2, "pmk"), _text(3, "1009")), "1009"),
-}
-
-UNKEYED_DETAILS = {
-    "message": _variant(1, _text(100, "contents")),
-    "group create": _group_change(1, _text(3, "title")),
-    "group member remove": _group_change(7),
-    "group description": _group_change(14, _text(1, "about")),
-    "read receipt": _variant(12, _text(1, "299")),
-    "grok reply": _variant(16, _text(6, "plaintext reply")),
-    "unknown detail": _variant(18),
-}
-
-
 def unencrypted_message_event(text: str, sender_id: str = "222") -> str:
     """A message with plaintext contents and no conversation key version."""
     message_contents = _struct(_field(STRING, 1, _string(text)))
@@ -180,7 +157,7 @@ class OfflineChat:
 
 
 class RecordingChat(OfflineChat):
-    """Records each decrypt_events batch and whether it rejected unverified events."""
+    """Records each decrypt_events batch and whether unverified events were rejected."""
 
     def __init__(self, juicebox_config: str) -> None:
         super().__init__(juicebox_config)
@@ -296,52 +273,24 @@ class SkippedSigningKeyTest(unittest.TestCase):
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
 
 
-class EventClassificationTest(unittest.TestCase):
-    def key_version(self, detail: bytes) -> str | None:
-        return xchat_lite._event_info(_event(detail))["key_version"]
-
-    def test_details_that_carry_a_key_version(self):
-        for name, (detail, version) in KEYED_DETAILS.items():
-            with self.subTest(name):
-                self.assertEqual(self.key_version(detail), version)
-
-    def test_details_without_a_key_version(self):
-        for name, detail in UNKEYED_DETAILS.items():
-            with self.subTest(name):
-                self.assertIsNone(self.key_version(detail))
-
-    def test_an_empty_key_version_still_counts(self):
-        detail = _variant(1, _text(100, "contents"), _text(101, ""))
-        self.assertEqual(self.key_version(detail), "")
-
-    def test_only_a_string_key_version_counts(self):
-        numeric = _field(I32, 101, struct.pack(">i", 1001))
-        self.assertIsNone(self.key_version(_variant(1, _text(100, "contents"), numeric)))
-
-    def test_undecodable_payloads_are_unclassified(self):
-        truncated = _event(KEYED_DETAILS["message"][0])[:16]
-        for payload in ("ENCODED_100", "", truncated):
-            with self.subTest(payload):
-                self.assertIsNone(xchat_lite._event_info(payload))
-
-
 class VerificationPolicyTest(unittest.TestCase):
-    def test_events_carrying_a_key_version_take_the_strict_pass(self):
-        keyed = [_event(detail) for detail, _ in KEYED_DETAILS.values()]
-        keyed.append(_event(_variant(1, _text(100, "contents"), _text(101, ""))))
-        unkeyed = [_event(detail) for detail in UNKEYED_DETAILS.values()]
+    def test_every_event_is_accepted_in_one_pass(self):
+        events = [
+            VECTORS["key_change_event"],
+            VECTORS["message_event"],
+            unencrypted_message_event("plain"),
+        ]
         chat = RecordingChat("{}")
-        xchat_lite._decrypt(chat, {"events": keyed + unkeyed})
+        xchat_lite._decrypt(chat, {"events": events})
 
-        self.assertEqual(chat.batches, [(True, keyed), (False, unkeyed)])
+        self.assertEqual(chat.batches, [(False, events)])
 
-    def test_unsigned_group_description_change_naming_a_key_version_is_rejected(self):
-        keyed = _event(KEYED_DETAILS["group description"][0])
-        unkeyed = _event(UNKEYED_DETAILS["group description"])
-        result = run_decrypt({"events": [keyed, unkeyed]})
+    def test_unsigned_group_description_change_is_returned(self):
+        event = _event(_group_change(14, _text(1, "about"), _text(2, "1007")))
+        result = run_decrypt({"events": [event]})
 
-        self.assertIn("signature", result["errors"]["0"].lower())
-        self.assertEqual([m["event"]["type"] for m in result["messages"]], ["GroupChange"])
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(summary(result), [("GroupChange", "unverified", "")])
 
     def test_unencrypted_message_is_readable_and_marked(self):
         result = run_decrypt({"events": [unencrypted_message_event("sent before encryption")]})
@@ -360,36 +309,51 @@ class VerificationPolicyTest(unittest.TestCase):
         )
         self.assertEqual(result["unverified_senders"], [])
 
-    def test_encrypted_message_without_a_verifiable_key_has_no_text(self):
+    def test_encrypted_message_without_a_signing_key_returns_text(self):
         result = run_decrypt(encrypted_thread([]))
 
-        self.assertNotIn(MESSAGE_TEXT, json.dumps(result))
-        [message] = result["messages"]
-        self.assertEqual(message["status"], "unverified")
-        self.assertEqual(message["event"]["sender_id"], SENDER_ID)
-        self.assertIn("signature", message["error"].lower())
+        self.assertEqual(
+            summary(result),
+            [("KeyChange", "unverified", ""), ("Message", "unverified", MESSAGE_TEXT)],
+        )
+        self.assertNotIn("error", result["messages"][1])
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
 
-    def test_message_naming_a_key_version_is_verified_even_when_decryptable(self):
+    def test_unsigned_encrypted_message_returns_its_text(self):
         payload = encrypted_thread([mcp_key()])
         payload["events"] = [unsigned_encrypted_message_event("forged without a signature")]
         result = run_decrypt(payload)
 
-        self.assertNotIn("forged without a signature", json.dumps(result))
         self.assertEqual(
             summary(result),
-            [("KeyChange", "verified", ""), ("Message", "unverified", "")],
+            [("KeyChange", "verified", ""), ("Message", "unverified", "forged without a signature")],
         )
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
 
-    def test_policy_is_chosen_per_event(self):
+    def test_message_that_cannot_be_decrypted_has_no_text(self):
+        text = "needs a conversation key"
+        result = run_decrypt({"events": [unsigned_encrypted_message_event(text)]})
+
+        self.assertNotIn(text, json.dumps(result))
+        [message] = result["messages"]
+        self.assertEqual(message["text"], "")
+        self.assertEqual(message["status"], "unverified")
+        self.assertEqual(message["event"]["sender_id"], SENDER_ID)
+        self.assertTrue(message["error"])
+        self.assertEqual(result["unverified_senders"], [])
+
+    def test_unencrypted_and_unverified_messages_share_one_pass(self):
         payload = encrypted_thread([])
         payload["events"].append({"encoded_event": unencrypted_message_event("plain", "222")})
         result = run_decrypt(payload)
 
         self.assertEqual(
             summary(result),
-            [("Message", "unverified", ""), ("Message", "unencrypted", "plain")],
+            [
+                ("KeyChange", "unverified", ""),
+                ("Message", "unverified", MESSAGE_TEXT),
+                ("Message", "unencrypted", "plain"),
+            ],
         )
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
 

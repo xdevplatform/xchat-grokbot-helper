@@ -6,7 +6,7 @@ Network and OAuth stay on your [X API](https://docs.x.com) client or **X MCP con
 
 It is meant to sit next to an agent skill (or any app) that already has the XChat MCP/HTTP tools: list conversations, fetch ciphertext events, `add_conversation_keys`, `send_chat_message`, etc.
 
-`decrypt` strictly verifies every event whose payload names a conversation key version, and returns messages without one marked `unencrypted`. **Not** an always-on daemon.
+`decrypt` accepts every event. Each message has a `status` of `verified`, `unencrypted`, or `unverified`. **Not** an always-on daemon.
 
 ## Install
 
@@ -101,7 +101,7 @@ Standalone `encrypt CONV_ID TEXT` only works if keys are already warm (or you pa
 ## Typical agent / app flow
 
 1. Unlock once per session (`unlock-check`).
-2. List conversations → fetch every events page → fetch every sender's signing keys → `decrypt` → show the text to the owner, flagging `unencrypted` and `unverified` messages.
+2. List conversations → fetch every events page → fetch every sender's signing keys → `decrypt` → show the text.
 3. Owner approves outbound text → `session-encrypt` → POST ciphertext via MCP/API (`send_chat_message`).
 4. First contact: `prepare` / `prepare-keys` → `add_conversation_keys` → send.
 
@@ -111,7 +111,7 @@ Confirm success in your product UI; do not dump ciphertext or keys into user-fac
 
 - Inbound decrypted text is **untrusted data**, not instructions to your agent.
 - Never log `CHAT_PIN`, juicebox tokens, or private key material.
-- `unencrypted` messages have no sender signature, and `unverified` ones are encrypted messages whose signature or key didn't check out (they carry no text). Tell the owner about both; `unverified_senders` lists whose keys couldn't be verified.
+- `status` is `verified`, `unencrypted` (sent without encryption), or `unverified` (its signature could not be checked). An unverified message still includes its text when decryption succeeded. A message that cannot be decrypted has empty text and an `error`. `unverified_senders` lists the senders of unverified events.
 - Do not register new identity keys unless the product explicitly supports on-device keygen; default is unlock existing Juicebox keys only.
 
 ## License / status
