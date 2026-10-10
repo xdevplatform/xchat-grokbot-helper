@@ -2,7 +2,8 @@
 """Thin local crypto helper for XChat via X MCP + chatxdk.
 
 Network stays on the X connector MCP. This process only unlocks Juicebox
-keys and encrypts/decrypts. Never print PIN, private keys, or juicebox tokens.
+keys (or loads a saved key) and encrypts/decrypts. Never print PIN, private
+keys, or juicebox tokens.
 
 Env:
   CHAT_PIN              Juicebox PIN (secret-request → env; never echo)
@@ -11,7 +12,11 @@ Env:
   XCHAT_JUICEBOX_JSON   path to juicebox_config JSON file, or inline JSON
 
 CLI:
-  unlock-check
+  --remember-key          # after a PIN unlock, save the private keys in the OS keyring, else in
+                          # ~/.config/xchat-grokbot-helper/saved-key.json (mode 600). Later runs
+                          # for the same user id and key version skip Juicebox and the PIN.
+  unlock-check            # stdout adds key_source (saved | pin) and key_saved
+  forget                  # delete the saved key
   decrypt                 # stdin: {"events":[...], "conversation_key_events":[...], "signing_keys":[...]}
                           #         or a bare list of event base64 strings
                           # events: data[].encoded_event strings (or the data[] objects)
@@ -41,6 +46,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -94,11 +100,135 @@ def _load_pin() -> str:
     raise SystemExit("CHAT_PIN is not set (env or box-secrets card)")
 
 
-def _session_from_env(args: argparse.Namespace) -> tuple[Chat, str]:
-    pin = _load_pin()
-    juicebox = _load_juicebox_config(
-        args.juicebox or os.environ.get("XCHAT_JUICEBOX_JSON", "")
-    )
+_SAVED_KEY_SERVICE = "xchat-grokbot-helper"
+_SAVED_KEY_NAME = "saved-key"
+_SAVED_KEY_FORMAT = 1
+_OS_KEYRINGS = tuple(
+    f"keyring.backends.{name}" for name in ("macOS", "Windows", "SecretService", "libsecret", "kwallet")
+)
+
+
+def _key_file() -> Path:
+    config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(config) / _SAVED_KEY_SERVICE / f"{_SAVED_KEY_NAME}.json"
+
+
+def _keyring() -> Any:
+    """The OS keyring backend, or None.
+
+    Other keyring backends are skipped: they can store secrets in plain files
+    or prompt for a password.
+    """
+    try:
+        import keyring
+
+        backend = keyring.get_keyring()
+        candidates = [*getattr(backend, "backends", []), backend]
+    except Exception:
+        return None
+    return next((b for b in candidates if type(b).__module__ in _OS_KEYRINGS), None)
+
+
+def _read_saved_key() -> str | None:
+    backend = _keyring()
+    if backend is not None:
+        try:
+            saved = backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME)
+        except Exception:
+            saved = None
+        if saved:
+            return saved
+    try:
+        return _key_file().read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+
+
+def _forget_saved_key() -> bool:
+    """Delete the saved key from the key file and the OS keyring. True when there was one."""
+    forgotten = False
+    try:
+        _key_file().unlink()
+        forgotten = True
+    except FileNotFoundError:
+        pass
+    backend = _keyring()
+    if backend is not None and backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is not None:
+        backend.delete_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME)
+        forgotten = True
+    return forgotten
+
+
+def _write_saved_key(saved: str) -> None:
+    """Store in the OS keyring, or in a mode-600 file in a mode-700 directory when that fails."""
+    _forget_saved_key()
+    backend = _keyring()
+    if backend is not None:
+        try:
+            backend.set_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME, saved)
+            return
+        except Exception:
+            pass
+    path = _key_file()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    # mkstemp creates the file with mode 600.
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(saved)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def _save_key(chat: Chat, user_id: str, version: str) -> bool:
+    """Save the unlocked private keys for later runs. Warns and returns False when that fails."""
+    keys = chat.export_keys()
+    try:
+        record = {
+            "format": _SAVED_KEY_FORMAT,
+            "user_id": user_id,
+            "key_version": version,
+            "private_keys": base64.b64encode(keys).decode(),
+        }
+        _write_saved_key(json.dumps(record))
+        return True
+    except Exception as e:
+        print(f"Could not save the X Chat key on this computer ({type(e).__name__}).", file=sys.stderr)
+        return False
+    finally:
+        if keys:
+            keys[:] = bytes(len(keys))
+
+
+def _load_saved_key(user_id: str, version: str) -> Chat | None:
+    """A Chat holding the key saved for this user id and key version, or None.
+
+    A saved key that is unreadable or was saved for another user id, key
+    version or file format also gives None, so the caller unlocks with the PIN.
+    """
+    saved = _read_saved_key()
+    if saved is None:
+        return None
+    try:
+        record = json.loads(saved)
+        expected = {"format": _SAVED_KEY_FORMAT, "user_id": user_id, "key_version": version}
+        mismatched = [name for name, value in expected.items() if record.get(name) != value]
+        if not mismatched:
+            chat = Chat()
+            chat.import_keys(base64.b64decode(record["private_keys"], validate=True), version=version)
+            return chat
+        reason = "different " + ", ".join(mismatched)
+    except Exception:
+        reason = "unreadable"
+    print(f"Saved X Chat key not used ({reason}); the Chat PIN is needed.", file=sys.stderr)
+    return None
+
+
+def _open_session(args: argparse.Namespace) -> tuple[Chat, str, dict[str, Any]]:
+    """Load the saved key, or unlock Juicebox with the PIN once and save the key on --remember-key."""
     user_id = args.user_id or os.environ.get("XCHAT_USER_ID", "")
     version = str(
         args.key_version
@@ -108,10 +238,25 @@ def _session_from_env(args: argparse.Namespace) -> tuple[Chat, str]:
     if not user_id:
         raise SystemExit("Pass --user-id or set XCHAT_USER_ID")
 
-    chat = Chat(juicebox)
-    chat.unlock(pin)
+    chat = _load_saved_key(user_id, version)
+    if chat is not None:
+        key_status = {"key_source": "saved", "key_saved": True}
+    else:
+        pin = _load_pin()
+        juicebox = _load_juicebox_config(
+            args.juicebox or os.environ.get("XCHAT_JUICEBOX_JSON", "")
+        )
+        chat = Chat(juicebox)
+        chat.unlock(pin)
+        saved = args.remember_key and _save_key(chat, user_id, version)
+        key_status = {"key_source": "pin", "key_saved": saved}
     chat.set_identity(user_id, version)
     chat.set_cache_keys(True)
+    return chat, user_id, key_status
+
+
+def _session_from_env(args: argparse.Namespace) -> tuple[Chat, str]:
+    chat, user_id, _ = _open_session(args)
     return chat, user_id
 
 
@@ -436,7 +581,7 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
 
 
 def cmd_unlock_check(args: argparse.Namespace) -> None:
-    chat, user_id = _session_from_env(args)
+    chat, user_id, key_status = _open_session(args)
     print(
         json.dumps(
             {
@@ -444,9 +589,14 @@ def cmd_unlock_check(args: argparse.Namespace) -> None:
                 "unlocked": bool(chat.is_unlocked()),
                 "user_id": user_id,
                 "has_identity_key": bool(chat.has_identity_key()),
+                **key_status,
             }
         )
     )
+
+
+def cmd_forget(args: argparse.Namespace) -> None:
+    print(json.dumps({"ok": True, "forgotten": _forget_saved_key()}))
 
 
 def cmd_decrypt(args: argparse.Namespace) -> None:
@@ -563,9 +713,15 @@ def main() -> None:
         default="",
         help="Path to juicebox_config JSON, or inline JSON",
     )
+    parser.add_argument(
+        "--remember-key",
+        action="store_true",
+        help="After a PIN unlock, save the private keys on this computer so later runs skip the PIN",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("unlock-check", help="Verify PIN unlocks Juicebox keys")
+    sub.add_parser("unlock-check", help="Verify the saved key or PIN unlocks the keys")
+    sub.add_parser("forget", help="Delete the key saved by --remember-key")
     sub.add_parser("decrypt", help="Decrypt event blobs from stdin JSON")
     p_enc = sub.add_parser(
         "encrypt",
@@ -587,6 +743,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.cmd == "unlock-check":
         cmd_unlock_check(args)
+    elif args.cmd == "forget":
+        cmd_forget(args)
     elif args.cmd == "decrypt":
         cmd_decrypt(args)
     elif args.cmd == "encrypt":

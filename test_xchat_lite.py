@@ -3,14 +3,21 @@ import base64
 import io
 import json
 import os
+import stat
 import struct
+import sys
+import tempfile
+import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 import chat_xdk
 
 import xchat_lite
+
+real_keyring_lookup = xchat_lite._keyring
 
 STOP, BOOL, STRING, STRUCT = 0, 2, 11, 12
 
@@ -146,7 +153,7 @@ def encrypted_thread(signing_keys) -> dict:
 class OfflineChat:
     """A real chat_xdk.Chat whose unlock() loads the vector keys instead of calling Juicebox."""
 
-    def __init__(self, juicebox_config: str) -> None:
+    def __init__(self, juicebox_config: str = "") -> None:
         self._chat = chat_xdk.Chat()
 
     def unlock(self, pin: str) -> None:
@@ -154,6 +161,11 @@ class OfflineChat:
 
     def __getattr__(self, name: str):
         return getattr(self._chat, name)
+
+
+class NoUnlockChat(OfflineChat):
+    def unlock(self, pin: str) -> None:
+        raise AssertionError("unlock should not run")
 
 
 class RecordingChat(OfflineChat):
@@ -174,7 +186,7 @@ class RecordingChat(OfflineChat):
 
 
 def run_decrypt(payload) -> dict:
-    args = argparse.Namespace(user_id="2222", key_version="1", juicebox="{}")
+    args = argparse.Namespace(user_id="2222", key_version="1", juicebox="{}", remember_key=False)
     out = io.StringIO()
     with (
         mock.patch.object(xchat_lite, "Chat", OfflineChat),
@@ -188,6 +200,55 @@ def run_decrypt(payload) -> dict:
 
 def summary(result: dict) -> list[tuple[str, str, str]]:
     return [(m["event"]["type"], m["status"], m["text"]) for m in result["messages"]]
+
+
+PIN = "test-pin"
+
+
+def run_cli(*argv: str, pin: str = "", chat=OfflineChat, stdin=None) -> dict:
+    """Run the CLI as user 2222 with key version 1 and return its JSON output.
+
+    Fails if the PIN or the private keys reach stdout or stderr.
+    """
+    out, err = io.StringIO(), io.StringIO()
+    with (
+        mock.patch.object(xchat_lite, "Chat", chat),
+        mock.patch.dict(os.environ, {"CHAT_PIN": pin}),
+        mock.patch("sys.argv", ["xchat_lite.py", "--user-id", "2222", "--key-version", "1", *argv]),
+        mock.patch("sys.stdin", io.StringIO(json.dumps(stdin))),
+        redirect_stdout(out),
+        redirect_stderr(err),
+    ):
+        xchat_lite.main()
+    if any(secret in out.getvalue() + err.getvalue() for secret in (PIN, VECTORS["private_keys"])):
+        raise AssertionError("the PIN or private keys reached the output")
+    return json.loads(out.getvalue())
+
+
+class FakeKeyring:
+    def __init__(self) -> None:
+        self.passwords: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, name: str) -> str | None:
+        return self.passwords.get((service, name))
+
+    def set_password(self, service: str, name: str, password: str) -> None:
+        self.passwords[service, name] = password
+
+    def delete_password(self, service: str, name: str) -> None:
+        del self.passwords[service, name]
+
+
+def setUpModule() -> None:
+    """Keep every test away from the real keyring and ~/.config."""
+    config = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(config.cleanup)
+    for patch in (
+        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}),
+        mock.patch.object(xchat_lite, "_keyring", lambda: None),
+    ):
+        patch.start()
+        unittest.addModuleCleanup(patch.stop)
 
 
 class SigningKeyNormalizationTest(unittest.TestCase):
@@ -356,6 +417,96 @@ class VerificationPolicyTest(unittest.TestCase):
             ],
         )
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
+
+
+class SavedKeyTest(unittest.TestCase):
+    def setUp(self):
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        patch = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.key_file = Path(config.name, "xchat-grokbot-helper", "saved-key.json")
+
+    def remember(self) -> dict:
+        return run_cli("--juicebox", "{}", "--remember-key", "unlock-check", pin=PIN)
+
+    def test_remember_key_saves_the_unlocked_key(self):
+        result = self.remember()
+
+        self.assertEqual((result["key_source"], result["key_saved"]), ("pin", True))
+        self.assertEqual(stat.S_IMODE(self.key_file.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(self.key_file.parent.stat().st_mode), 0o700)
+        self.assertEqual(
+            json.loads(self.key_file.read_text()),
+            {"format": 1, "user_id": "2222", "key_version": "1", "private_keys": VECTORS["private_keys"]},
+        )
+
+    def test_nothing_is_saved_by_default(self):
+        result = run_cli("--juicebox", "{}", "unlock-check", pin=PIN)
+
+        self.assertEqual((result["key_source"], result["key_saved"]), ("pin", False))
+        self.assertFalse(self.key_file.parent.exists())
+
+    def test_saved_key_skips_juicebox_and_the_pin(self):
+        self.remember()
+
+        status = run_cli("unlock-check", chat=NoUnlockChat)
+        result = run_cli("decrypt", chat=NoUnlockChat, stdin=encrypted_thread([mcp_key()]))
+
+        self.assertEqual((status["key_source"], status["key_saved"]), ("saved", True))
+        self.assertEqual(summary(result)[-1], ("Message", "verified", MESSAGE_TEXT))
+
+    def test_forget_deletes_the_saved_key(self):
+        self.remember()
+
+        self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": True})
+        self.assertFalse(self.key_file.exists())
+        self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": False})
+        self.assertEqual(run_cli("--juicebox", "{}", "unlock-check", pin=PIN)["key_source"], "pin")
+
+    def test_unusable_saved_key_falls_back_to_one_pin_unlock(self):
+        self.remember()
+        record = json.loads(self.key_file.read_text())
+        cases = {
+            "not JSON": "{",
+            "another file format": json.dumps({**record, "format": 2}),
+            "another account": json.dumps({**record, "user_id": "3333"}),
+            "another key version": json.dumps({**record, "key_version": "2"}),
+            "invalid key bytes": json.dumps({**record, "private_keys": base64.b64encode(bytes(64)).decode()}),
+        }
+        for name, saved in cases.items():
+            with self.subTest(name):
+                self.key_file.write_text(saved)
+                with mock.patch.object(
+                    OfflineChat, "unlock", autospec=True, side_effect=OfflineChat.unlock
+                ) as unlock:
+                    result = run_cli("--juicebox", "{}", "unlock-check", pin=PIN)
+
+                unlock.assert_called_once()
+                self.assertEqual((result["key_source"], result["key_saved"]), ("pin", False))
+
+    def test_os_keyring_holds_the_key_when_available(self):
+        keyring = FakeKeyring()
+        with mock.patch.object(xchat_lite, "_keyring", lambda: keyring):
+            self.assertTrue(self.remember()["key_saved"])
+            self.assertFalse(self.key_file.exists())
+            self.assertEqual(run_cli("unlock-check", chat=NoUnlockChat)["key_source"], "saved")
+            self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": True})
+        self.assertEqual(keyring.passwords, {})
+
+    def test_only_os_keyring_backends_are_used(self):
+        def backend(module: str):
+            return type("Backend", (), {"__module__": module})()
+
+        os_keyring, file_keyring = backend("keyring.backends.SecretService"), backend("keyrings.alt.file")
+        chainer = type("Chainer", (), {"__module__": "keyring.backends.chainer"})()
+        chainer.backends = [file_keyring, os_keyring]
+        fake_module = types.SimpleNamespace(get_keyring=lambda: chainer)
+        with mock.patch.dict(sys.modules, {"keyring": fake_module}):
+            self.assertIs(real_keyring_lookup(), os_keyring)
+            fake_module.get_keyring = lambda: file_keyring
+            self.assertIsNone(real_keyring_lookup())
 
 
 if __name__ == "__main__":
