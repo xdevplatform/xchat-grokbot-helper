@@ -107,6 +107,9 @@ def _session_from_env(args: argparse.Namespace) -> tuple[Chat, str]:
     chat.unlock(pin)
     chat.set_identity(user_id, version)
     chat.set_cache_keys(True)
+    # Unencrypted messages carry no signature and would be rejected; return them
+    # (and any other unverified event) with verified=false instead.
+    chat.set_reject_unverified(False)
     return chat, user_id
 
 
@@ -311,10 +314,10 @@ def cmd_session_encrypt(args: argparse.Namespace) -> None:
         send_fields = _encrypt_payload(chat, conversation_id, text, **enc_kwargs)
     except Exception as e:
         raise SystemExit(
-            f"session-encrypt failed: {e}. For empty threads use prepare + MCP "
-            f"add_conversation_keys first. For existing threads include conversation_key_events "
-            f"+ encoded_event list so decrypt can warm keys. Classic (unencrypted) DMs are "
-            f"out of scope for this helper."
+            f"session-encrypt failed: {e}. For empty threads, or threads with only "
+            f"unencrypted messages, use prepare + MCP add_conversation_keys first. For "
+            f"encrypted threads include conversation_key_events + encoded_event list so "
+            f"decrypt can warm keys."
         ) from e
 
     out: dict[str, Any] = {
