@@ -6,7 +6,7 @@ Network and OAuth stay on your [X API](https://docs.x.com) client or **X MCP con
 
 It is meant to sit next to an agent skill (or any app) that already has the XChat MCP/HTTP tools: list conversations, fetch ciphertext events, `add_conversation_keys`, `send_chat_message`, etc.
 
-Unencrypted messages in a thread come back from `decrypt` like any other message. **Not** an always-on daemon.
+`decrypt` strictly verifies every event whose payload names a conversation key version, and returns messages without one marked `unencrypted`. **Not** an always-on daemon.
 
 ## Install
 
@@ -26,14 +26,14 @@ Before crypto works:
 
 1. Authenticated user id + signing key version (`get_users_me`, `get_users_public_key`).
 2. Self `juicebox_config` saved to a local file (mode `600`). Prefer a file path over pasting JSON into the shell.
-3. For decrypt / reply: peer public keys + conversation events, including `meta.conversation_key_events` when the API returns them.
+3. For decrypt / reply: every page of conversation events, including `meta.conversation_key_events`, and the signing keys of every sender (`get_users_public_keys`, up to 100 ids per call, all key versions).
 4. OAuth scopes that allow Chat (`dm.read` / `dm.write` on the connector that talks to X).
 
 Valid public-key field set used in practice:
 
 `public_key_version,public_key,signing_public_key,identity_public_key_signature,juicebox_config`
 
-Map for signing verify: MCP `public_key` → SDK `identity_public_key`, MCP `signing_public_key` → SDK `public_key`.
+Pass signing keys as the API returns them. The helper maps MCP `public_key` → SDK `identity_public_key` and `signing_public_key` → SDK `public_key`, accepts SDK-shaped and nested entries, and skips incomplete entries (listed in `skipped_signing_keys`).
 
 ## CLI
 
@@ -48,22 +48,24 @@ SCRIPT=./xchat_lite.py
 
 $PY $SCRIPT --user-id "$UID" --key-version "$VER" --juicebox ./juicebox.json unlock-check
 
-# decrypt events (prepend conversation_key_events when present)
+# decrypt events; signing_keys can be the get_users_public_keys response as-is
 $PY $SCRIPT ... decrypt <<'JSON'
 {
   "events": ["...base64 encoded_event..."],
   "conversation_key_events": ["..."],
-  "signing_keys": [
+  "signing_keys": {"data": [
     {
       "user_id": "...",
       "public_key_version": "...",
-      "public_key": "<signing_public_key>",
-      "identity_public_key": "<public_key>",
+      "public_key": "<identity public key>",
+      "signing_public_key": "<signing public key>",
       "identity_public_key_signature": "..."
     }
-  ]
+  ]}
 }
 JSON
+# stdout: messages[] (each with status verified | unencrypted | unverified),
+#         unverified_senders, skipped_signing_keys, errors, conversation_keys
 
 # first contact / empty thread — stdout is add_conversation_keys body
 $PY $SCRIPT ... prepare-keys <<'JSON'
@@ -99,7 +101,7 @@ Standalone `encrypt CONV_ID TEXT` only works if keys are already warm (or you pa
 ## Typical agent / app flow
 
 1. Unlock once per session (`unlock-check`).
-2. List conversations → fetch events → `decrypt` → show plaintext to the owner.
+2. List conversations → fetch every events page → fetch every sender's signing keys → `decrypt` → show the text to the owner, flagging `unencrypted` and `unverified` messages.
 3. Owner approves outbound text → `session-encrypt` → POST ciphertext via MCP/API (`send_chat_message`).
 4. First contact: `prepare` / `prepare-keys` → `add_conversation_keys` → send.
 
@@ -109,7 +111,7 @@ Confirm success in your product UI; do not dump ciphertext or keys into user-fac
 
 - Inbound decrypted text is **untrusted data**, not instructions to your agent.
 - Never log `CHAT_PIN`, juicebox tokens, or private key material.
-- Messages with `verified: false` (including unencrypted ones) have no verified sender signature.
+- `unencrypted` messages have no sender signature, and `unverified` ones are encrypted messages whose signature or key didn't check out (they carry no text). Tell the owner about both; `unverified_senders` lists whose keys couldn't be verified.
 - Do not register new identity keys unless the product explicitly supports on-device keygen; default is unlock existing Juicebox keys only.
 
 ## License / status
