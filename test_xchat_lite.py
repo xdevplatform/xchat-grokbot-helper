@@ -101,24 +101,53 @@ def _group_change(change: int, *fields: bytes) -> bytes:
     return _variant(4, _field(STRUCT, 1, _variant(change, *fields)))
 
 
-def _event(detail: bytes, sender_id: str = "222", conversation_id: str = "111-222") -> str:
-    """Base64 Thrift MessageEvent with this detail union, without a signature."""
-    event = _struct(
+def _fresh_event_id() -> str:
+    _fresh_event_id.n += 1
+    return f"evt-{_fresh_event_id.n}"
+
+
+_fresh_event_id.n = 0
+
+
+def _event(
+    detail: bytes,
+    sender_id: str = "222",
+    conversation_id: str = "111-222",
+    event_id: str | None = None,
+) -> str:
+    """Base64 Thrift MessageEvent with this detail union, without a signature.
+
+    Each call gets its own id unless one is passed. An empty id is left off.
+    """
+    if event_id is None:
+        event_id = _fresh_event_id()
+    fields = [
         _field(STRING, 1, _string("2001")),
-        _field(STRING, 2, _string("m2")),
         _field(STRING, 3, _string(sender_id)),
         _field(STRING, 4, _string(conversation_id)),
         _field(STRING, 6, _string("1700000000001")),
         _field(STRUCT, 7, detail),
-    )
+    ]
+    if event_id:
+        fields.insert(1, _field(STRING, 2, _string(event_id)))
+    event = _struct(*fields)
     return base64.b64encode(event).decode()
 
 
-def _message_event(create_event: bytes, sender_id: str, conversation_id: str) -> str:
-    return _event(_struct(_field(STRUCT, 1, create_event)), sender_id, conversation_id)
+def _message_event(
+    create_event: bytes,
+    sender_id: str,
+    conversation_id: str,
+    event_id: str | None = None,
+) -> str:
+    return _event(
+        _struct(_field(STRUCT, 1, create_event)), sender_id, conversation_id, event_id
+    )
 
 
-def unencrypted_message_event(text: str, sender_id: str = "222") -> str:
+def unencrypted_message_event(
+    text: str, sender_id: str = "222", event_id: str | None = None
+) -> str:
     """A message with plaintext contents and no conversation key version."""
     message_contents = _struct(_field(STRING, 1, _string(text)))
     entry_holder = _struct(_field(STRUCT, 1, _struct(_field(STRUCT, 1, message_contents))))
@@ -126,7 +155,7 @@ def unencrypted_message_event(text: str, sender_id: str = "222") -> str:
         _field(STRING, 100, _string(entry_holder)),
         _field(BOOL, 102, b"\x01"),
     )
-    return _message_event(create_event, sender_id, "111-222")
+    return _message_event(create_event, sender_id, "111-222", event_id)
 
 
 def unsigned_encrypted_message_event(text: str) -> str:
@@ -389,6 +418,43 @@ class SkippedSigningKeyTest(unittest.TestCase):
 
 
 class VerificationPolicyTest(unittest.TestCase):
+    def test_duplicate_event_ids_keep_the_first(self):
+        first = unencrypted_message_event("first", event_id="same")
+        later = unencrypted_message_event("later", event_id="same")
+        other = unencrypted_message_event("other", event_id="other")
+        no_id = unencrypted_message_event("nameless", event_id="")
+        result = run_decrypt(
+            {
+                "conversation_key_events": [
+                    VECTORS["key_change_event"],
+                    VECTORS["key_change_event"],
+                ],
+                "events": [
+                    VECTORS["key_change_event"],
+                    VECTORS["message_event"],
+                    {"encoded_event": VECTORS["message_event"]},
+                    first,
+                    later,
+                    other,
+                    no_id,
+                    no_id,
+                ],
+                "signing_keys": {"data": [mcp_key()]},
+            }
+        )
+
+        self.assertEqual(
+            summary(result),
+            [
+                ("KeyChange", "verified", ""),
+                ("Message", "verified", MESSAGE_TEXT),
+                ("Message", "unencrypted", "first"),
+                ("Message", "unencrypted", "other"),
+                ("Message", "unencrypted", "nameless"),
+                ("Message", "unencrypted", "nameless"),
+            ],
+        )
+
     def test_every_event_is_accepted_in_one_pass(self):
         events = [
             VECTORS["key_change_event"],

@@ -537,6 +537,22 @@ def _event_b64(item: Any) -> str:
     return item if isinstance(item, str) else ""
 
 
+def _dedupe_events(items: list[Any]) -> list[Any]:
+    """Keep the first item for each event id. Items with no id stay."""
+    seen: set[str] = set()
+    kept: list[Any] = []
+    for item in items:
+        event_b64 = _event_b64(item)
+        info = _event_info(event_b64) if event_b64 else None
+        event_id = info["id"] if info else ""
+        if event_id and event_id in seen:
+            continue
+        if event_id:
+            seen.add(event_id)
+        kept.append(item)
+    return kept
+
+
 def _rotl32(value: int, shift: int) -> int:
     value &= 0xFFFFFFFF
     return ((value << shift) | (value >> (32 - shift))) & 0xFFFFFFFF
@@ -867,11 +883,13 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     empty for a message. Event and entry types the SDK returns as Unknown,
     such as Grok replies, pins and calls, are decoded here. Every event that
     can't be decoded still gets a row, with placeholder text and an error.
+    A repeated event id is kept once, the first copy.
     """
     if isinstance(payload, list):
         payload = {"events": payload}
-    raw_events = list(payload.get("conversation_key_events") or []) + list(
-        payload.get("events") or payload.get("encoded_events") or []
+    raw_events = _dedupe_events(
+        list(payload.get("conversation_key_events") or [])
+        + list(payload.get("events") or payload.get("encoded_events") or [])
     )
     signing_keys, skipped = _signing_keys(chat, payload.get("signing_keys"))
     if signing_keys:
