@@ -21,7 +21,9 @@ CLI:
                           #         or a bare list of event base64 strings
                           # events: data[].encoded_event strings (or the data[] objects)
                           # signing_keys: get_users_public_keys entries for every sender, as returned
-                          # stdout: messages[] with status verified | unencrypted | unverified,
+                          # stdout: messages[], one per event, with display text and status
+                          #         verified | unencrypted | unverified (placeholder text and
+                          #         an error when an event can't be decoded),
                           #         unverified_senders, skipped_signing_keys, errors
   prepare-keys            # stdin: {"public_keys":[...], "conversation_id"?}
                           # public_keys entries: user_id, public_key (identity), key_version
@@ -42,6 +44,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hmac
 import json
 import os
 import struct
@@ -457,6 +460,26 @@ _DETAIL_KEY_VERSION_FIELDS = {1: 101, 3: 1, 15: 5, 17: 3}
 # change event (detail variant 4), that carries one: create, title, avatar,
 # member add, description.
 _GROUP_CHANGE_KEY_VERSION_FIELDS = {1: 5, 2: 2, 3: 2, 5: 6, 14: 2}
+_DETAIL_TYPES = {
+    1: "Message",
+    3: "KeyChange",
+    4: "GroupChange",
+    5: "Failure",
+    6: "Typing",
+    7: "MessageDeleted",
+    8: "ConversationDeleted",
+    9: "SettingsChange",
+    10: "GrokSearchResponse",
+    11: "EncryptedResendRequest",
+    12: "ReadReceipt",
+    13: "MarkedUnread",
+    14: "MemberDeleted",
+    15: "GrokMessage",
+    16: "GrokResponse",
+    17: "PinMessage",
+    18: "UnpinMessage",
+    19: "PinKeysUpdate",
+}
 
 
 def _union_variant(union: Any) -> tuple[int | None, dict[int, Any]]:
@@ -485,7 +508,7 @@ def _detail_key_version(detail: Any) -> str | None:
 
 
 def _event_info(event_b64: str) -> dict[str, Any] | None:
-    """Ids, sender and conversation key version of a base64 message event.
+    """Ids, sender, type, parsed detail and conversation key version of a base64 message event.
 
     None when the payload doesn't decode.
     """
@@ -502,7 +525,8 @@ def _event_info(event_b64: str) -> dict[str, Any] | None:
         "sender_id": _scalar(event.get(3)),
         "conversation_id": _scalar(event.get(4)),
         "created_at_msec": int(created_at) if created_at.isdigit() else None,
-        "is_message": variant == 1,
+        "type": _DETAIL_TYPES.get(variant, "Unknown"),
+        "detail": event.get(7),
         "key_version": _detail_key_version(event.get(7)),
     }
 
@@ -513,10 +537,316 @@ def _event_b64(item: Any) -> str:
     return item if isinstance(item, str) else ""
 
 
-def _message_text(event: dict[str, Any]) -> str:
-    if event.get("type") != "Message":
-        return ""
-    return str((event.get("content") or {}).get("text") or "")
+def _rotl32(value: int, shift: int) -> int:
+    value &= 0xFFFFFFFF
+    return ((value << shift) | (value >> (32 - shift))) & 0xFFFFFFFF
+
+
+def _salsa20_rounds(state: list[int]) -> list[int]:
+    x = list(state)
+    for _ in range(10):
+        # A column round, then a row round.
+        for a, b, c, d in (
+            (0, 4, 8, 12), (5, 9, 13, 1), (10, 14, 2, 6), (15, 3, 7, 11),
+            (0, 1, 2, 3), (5, 6, 7, 4), (10, 11, 8, 9), (15, 12, 13, 14),
+        ):
+            x[b] ^= _rotl32(x[a] + x[d], 7)
+            x[c] ^= _rotl32(x[b] + x[a], 9)
+            x[d] ^= _rotl32(x[c] + x[b], 13)
+            x[a] ^= _rotl32(x[d] + x[c], 18)
+    return x
+
+
+def _salsa20_state(key: bytes, block: bytes) -> list[int]:
+    k, n = struct.unpack("<8I", key), struct.unpack("<4I", block)
+    return [0x61707865, *k[:4], 0x3320646E, *n, 0x79622D32, *k[4:], 0x6B206574]
+
+
+def _xsalsa20_stream(key: bytes, nonce: bytes, length: int) -> bytes:
+    # HSalsa20 turns the key and the first 16 nonce bytes into the Salsa20 key.
+    x = _salsa20_rounds(_salsa20_state(key, nonce[:16]))
+    subkey = struct.pack("<8I", *(x[i] for i in (0, 5, 10, 15, 6, 7, 8, 9)))
+    stream = bytearray()
+    for counter in range((length + 63) // 64):
+        state = _salsa20_state(subkey, nonce[16:] + struct.pack("<Q", counter))
+        rounds = _salsa20_rounds(state)
+        stream += struct.pack("<16I", *((a + b) & 0xFFFFFFFF for a, b in zip(rounds, state)))
+    return bytes(stream[:length])
+
+
+def _poly1305(key: bytes, message: bytes) -> bytes:
+    r = int.from_bytes(key[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    h, p = 0, (1 << 130) - 5
+    for i in range(0, len(message), 16):
+        h = (h + int.from_bytes(message[i : i + 16] + b"\x01", "little")) * r % p
+    return ((h + int.from_bytes(key[16:], "little")) % (1 << 128)).to_bytes(16, "little")
+
+
+def _open_box(key: bytes, box: bytes) -> bytes | None:
+    """Open an XSalsa20-Poly1305 box laid out as nonce (24), tag (16), ciphertext.
+
+    Message contents are binary Thrift, which Chat.decrypt() can't return
+    because it decodes the plaintext as UTF-8. None when the tag doesn't verify.
+    """
+    if len(key) != 32 or len(box) < 40:
+        return None
+    nonce, tag, ciphertext = box[:24], box[24:40], box[40:]
+    stream = _xsalsa20_stream(key, nonce, 32 + len(ciphertext))
+    if not hmac.compare_digest(_poly1305(stream[:32], ciphertext), tag):
+        return None
+    return bytes(c ^ k for c, k in zip(ciphertext, stream[32:]))
+
+
+_MEDIA_TYPES = {1: "image", 2: "gif", 3: "video", 4: "audio", 5: "file", 6: "svg"}
+_MEDIA_LABELS = {"image": "photo", "gif": "GIF", "video": "video", "audio": "audio", "svg": "image"}
+_ATTACHMENT_TYPES = {
+    1: "Media",
+    2: "Post",
+    3: "Url",
+    4: "UnifiedCard",
+    5: "Money",
+    6: "Jetfuel",
+    7: "PaymentReceipt",
+    8: "BotMessage",
+}
+# Field ids of the labeled MessageAttachment variants, keyed by attachment field name.
+_ATTACHMENT_FIELDS = {
+    1: {"filename": 6},
+    2: {"rest_id": 1, "post_url": 2},
+    3: {"url": 1},
+    4: {"url": 1},
+    5: {"fallback_text": 1},
+}
+_ATTACHMENT_LABELS = {
+    "Jetfuel": "[interactive card]",
+    "PaymentReceipt": "[payment receipt]",
+    "BotMessage": "[bot message]",
+}
+
+
+def _attachment_from_thrift(attachment: Any) -> dict[str, Any]:
+    """A MessageAttachment union in the SDK's flattened attachment shape."""
+    variant, fields = _union_variant(attachment)
+    names = _ATTACHMENT_FIELDS.get(variant, {})
+    info: dict[str, Any] = {name: _scalar(fields.get(field_id)) for name, field_id in names.items()}
+    info["attachment_type"] = _ATTACHMENT_TYPES.get(variant, "Unknown")
+    if variant == 1:
+        info["media_type"] = _MEDIA_TYPES.get(fields.get(3))
+    return info
+
+
+def _attachment_label(attachment: dict[str, Any], text: str) -> str:
+    """Label such as "[photo]" for one attachment, or "" for a link the text already shows."""
+    kind = attachment.get("attachment_type")
+    if kind == "Media":
+        media = attachment.get("media_type")
+        if media == "file":
+            return f"[file: {attachment['filename']}]" if attachment.get("filename") else "[file]"
+        return f"[{_MEDIA_LABELS.get(media, 'media')}]"
+    if kind == "Post":
+        post = attachment.get("post_url") or attachment.get("rest_id")
+        return f"[post: {post}]" if post else "[post]"
+    if kind in ("Url", "UnifiedCard"):
+        url = attachment.get("url") or ""
+        if url and url in text:
+            return ""
+        return f"[link: {url}]" if url else "[link]"
+    if kind == "Money":
+        return f"[payment: {attachment['fallback_text']}]" if attachment.get("fallback_text") else "[payment]"
+    return _ATTACHMENT_LABELS.get(kind, "[attachment]")
+
+
+def _with_labels(text: str, attachments: list[dict[str, Any]]) -> str:
+    """Text after one label per attachment, such as "[photo] caption"."""
+    labels = [label for label in (_attachment_label(a, text) for a in attachments) if label]
+    return " ".join([*labels, text]) if text.strip() else " ".join(labels)
+
+
+# content_type for each MessageEntryContents variant the SDK returns as Unknown.
+_ENTRY_TYPES = {
+    7: "ConversationPinned",
+    8: "ConversationUnpinned",
+    9: "ScreenCapture",
+    10: "CallEnded",
+    11: "CallMissed",
+    12: "Draft",
+    13: "MessageRequestAccepted",
+    14: "Nickname",
+    15: "VerifiedStatus",
+    16: "CallStarted",
+}
+# is_audio_only field id of each call variant.
+_AUDIO_ONLY_FIELDS = {10: 3, 11: 2, 16: 1}
+
+
+def _entry_content(holder: dict[int, Any]) -> dict[str, Any]:
+    """Content dict for a MessageEntryHolder, for entry types the SDK returns as Unknown."""
+    variant, fields = _union_variant(holder.get(1))
+    content: dict[str, Any] = {"content_type": _ENTRY_TYPES.get(variant, "Unknown")}
+    if variant in _AUDIO_ONLY_FIELDS:
+        content["audio_only"] = fields.get(_AUDIO_ONLY_FIELDS[variant]) is True
+    if variant == 10 and isinstance(fields.get(2), int):
+        content["duration_seconds"] = fields[2]
+    elif variant == 9:
+        content["recording"] = fields.get(1) == 2
+    elif variant == 12:
+        content["text"] = _scalar(fields.get(2))
+    elif variant == 14:
+        content.update(user_id=_scalar(fields.get(1)), nickname=_scalar(fields.get(2)))
+    elif variant == 15:
+        content.update(user_id=_scalar(fields.get(1)), verified=fields.get(2) is True)
+    elif variant not in _ENTRY_TYPES:
+        content["type_id"] = variant
+    return content
+
+
+def _fallback_content(info: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any] | None:
+    """Content of a message whose entry type the SDK returns as Unknown, or None.
+
+    Encrypted contents are opened again with the conversation key named by the event.
+    """
+    _, create = _union_variant(info.get("detail"))
+    contents = create.get(100)
+    version = info.get("key_version")
+    if isinstance(contents, bytes) and version is not None:
+        key = keys.get(version)
+        contents = _open_box(key, contents) if isinstance(key, bytes) else None
+    if not isinstance(contents, bytes):
+        return None
+    try:
+        holder, _ = _thrift_value(contents, 0, _THRIFT_STRUCT)
+    except (ValueError, IndexError, struct.error):
+        return None
+    return _entry_content(holder)
+
+
+def _duration(seconds: int) -> str:
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = [f"{n}{unit}" for n, unit in ((hours, "h"), (minutes, "m"), (seconds, "s")) if n]
+    return " ".join(parts) or "0s"
+
+
+_CONTENT_TEXT = {
+    "MarkRead": "[marked as read]",
+    "MarkUnread": "[marked as unread]",
+    "ConversationPinned": "[pinned the conversation]",
+    "ConversationUnpinned": "[unpinned the conversation]",
+    "MessageRequestAccepted": "[accepted the message request]",
+}
+
+
+def _content_text(content: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
+    """Display text for a message's content. Never empty."""
+    kind = content.get("content_type")
+    target = content.get("target_message_id") or "a message"
+    if kind == "Text":
+        text = str(content.get("text") or "")
+        forwarded = str((content.get("forwarded_message") or {}).get("message_text") or "")
+        if forwarded and not text.strip():
+            text = f"[forwarded] {forwarded}"
+        return _with_labels(text, attachments) or "[empty message]"
+    if kind == "Reaction":
+        return f"reacted {content.get('emoji') or ''} to {target}"
+    if kind == "ReactionRemoved":
+        return f"removed reaction {content.get('emoji') or ''} from {target}"
+    if kind == "Edit":
+        return f"edited {target}: {content.get('new_text') or ''}"
+    if kind in ("CallStarted", "CallEnded", "CallMissed"):
+        call = "audio call" if content.get("audio_only") else "call"
+        if kind == "CallStarted":
+            return f"[{call} started]"
+        if kind == "CallMissed":
+            return f"[missed {call}]"
+        duration = content.get("duration_seconds")
+        return f"[{call} ended, {_duration(duration)}]" if duration else f"[{call} ended]"
+    if kind == "ScreenCapture":
+        return "[recorded the screen]" if content.get("recording") else "[took a screenshot]"
+    if kind == "Draft":
+        return f"[draft] {content.get('text') or ''}".strip()
+    if kind == "Nickname":
+        return f"[set a nickname for {content.get('user_id')}: {content.get('nickname')}]"
+    if kind == "VerifiedStatus":
+        return f"[changed the verified status of {content.get('user_id')}]"
+    return _CONTENT_TEXT.get(kind, "[unsupported message]")
+
+
+_EVENT_TEXT = {
+    "GrokSearchResponse": "[Grok search results]",
+    "EncryptedResendRequest": "[asked to resend messages encrypted]",
+    "GrokMessage": "[message to Grok]",
+    "PinKeysUpdate": "[pinned message keys updated]",
+}
+
+
+def _grok_attachments(encoded: Any) -> list[dict[str, Any]]:
+    if not isinstance(encoded, bytes):
+        return []
+    try:
+        holder, _ = _thrift_value(encoded, 0, _THRIFT_STRUCT)
+    except (ValueError, IndexError, struct.error):
+        return []
+    items = holder.get(1)
+    return [_attachment_from_thrift(item) for item in items] if isinstance(items, list) else []
+
+
+def _fallback_event(info: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Fields and display text for an event whose detail type the SDK returns as Unknown."""
+    variant, fields = _union_variant(info.get("detail"))
+    kind = info.get("type")
+    if kind not in (*_EVENT_TEXT, "GrokResponse", "PinMessage", "UnpinMessage"):
+        return {"type": "Unknown", "event_type_id": variant}, "[unsupported event]"
+    event: dict[str, Any] = {"type": kind, "event_type_id": variant}
+    if kind == "GrokResponse":
+        reply = fields.get(6)
+        text = reply.decode("utf-8", "replace") if isinstance(reply, bytes) else ""
+        attachments = _grok_attachments(fields.get(7))
+        event.update(attachments=attachments, replying_to_sequence_id=_scalar(fields.get(10)) or None)
+        return event, _with_labels(text, attachments) or "[encrypted Grok reply]"
+    if kind == "PinMessage":
+        pinned = _scalar(fields.get(4))
+        event["message_sequence_id"] = pinned or None
+        return event, f"pinned message {pinned}" if pinned else "pinned a message"
+    if kind == "UnpinMessage":
+        entries = fields.get(3) if isinstance(fields.get(3), list) else [fields]
+        ids = [_scalar(entry.get(2)) for entry in entries if isinstance(entry, dict)]
+        event["message_sequence_ids"] = [i for i in ids if i]
+        unpinned = ", ".join(event["message_sequence_ids"])
+        return event, f"unpinned message {unpinned}" if unpinned else "unpinned a message"
+    return event, _EVENT_TEXT[kind]
+
+
+def _readable_event(
+    event: dict[str, Any], info: dict[str, Any], keys: dict[str, Any]
+) -> tuple[dict[str, Any], str]:
+    """The event with what the SDK left Unknown filled in, and its display text.
+
+    Text is empty only for decoded events that aren't messages, such as key
+    changes and read receipts.
+    """
+    if event.get("type") == "Message":
+        content = event.get("content") or {}
+        if content.get("content_type") == "Unknown":
+            content = _fallback_content(info, keys) or content
+            event = {**event, "content": content}
+        return event, _content_text(content, event.get("attachments") or [])
+    if event.get("type") == "Unknown":
+        fields, text = _fallback_event(info)
+        return {**event, **fields}, text
+    return event, ""
+
+
+def _placeholder(event_b64: str, info: dict[str, Any], error: str) -> dict[str, Any]:
+    """Row for an event that couldn't be decoded."""
+    kind = info.get("type", "Unknown")
+    meta = ("sequence_id", "id", "sender_id", "conversation_id", "created_at_msec")
+    return {
+        "event": {"type": kind, **{name: info.get(name) for name in meta}},
+        "text": "[could not decrypt this message]" if kind == "Message" else "[could not read this event]",
+        "original_b64": event_b64,
+        "status": "unverified",
+        "error": error,
+    }
 
 
 def _message_status(event: dict[str, Any], info: dict[str, Any] | None) -> str:
@@ -533,9 +863,10 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     """Decrypt every event, whether or not its signature can be verified.
 
     Each item has a status: verified, unencrypted (an event with no
-    conversation key version), or unverified. Text is included whenever
-    decryption succeeded, including for an unverified event. Only an event
-    that cannot be decrypted at all comes back without text.
+    conversation key version), or unverified, and display text that is never
+    empty for a message. Event and entry types the SDK returns as Unknown,
+    such as Grok replies, pins and calls, are decoded here. Every event that
+    can't be decoded still gets a row, with placeholder text and an error.
     """
     if isinstance(payload, list):
         payload = {"events": payload}
@@ -571,37 +902,34 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
             else:
                 errors[str(i)] = "no decrypt result"
 
+    keys = conversation_keys.get("keys") if isinstance(conversation_keys, dict) else None
     messages: list[dict[str, Any]] = []
     unverified_senders: set[str] = set()
     for i, event_b64 in enumerate(events):
-        event = decoded.get(i)
-        if event is not None:
-            status = _message_status(event, infos[i])
-            sender = str(event.get("sender_id") or "")
-            if status == "unverified" and sender:
-                unverified_senders.add(sender)
-            messages.append(
-                {
-                    "event": event,
-                    "text": _message_text(event),
-                    "original_b64": event_b64,
-                    "status": status,
-                }
-            )
+        if i not in decoded:
+            messages.append(_placeholder(event_b64, infos[i] or {}, errors.get(str(i), "")))
             continue
-        info = infos[i] or {}
-        if not info.get("is_message"):
-            continue
-        meta = ("sequence_id", "id", "sender_id", "conversation_id", "created_at_msec")
+        event, text = _readable_event(decoded[i], infos[i] or {}, keys or {})
+        status = _message_status(event, infos[i])
+        sender = str(event.get("sender_id") or "")
+        if status == "unverified" and sender:
+            unverified_senders.add(sender)
         messages.append(
             {
-                "event": {"type": "Message", **{name: info[name] for name in meta}},
-                "text": "",
+                "event": event,
+                "text": text,
                 "original_b64": event_b64,
-                "status": "unverified",
-                "error": errors.get(str(i), ""),
+                "status": status,
             }
         )
+    texts = {
+        m["event"].get("sequence_id"): m["text"] for m in messages if m["event"].get("type") == "Message"
+    }
+    for message in messages:
+        event = message["event"]
+        pinned = event.get("type") == "PinMessage" and texts.get(event.get("message_sequence_id"))
+        if pinned:
+            message["text"] += f": {pinned}"
     return {
         "messages": messages,
         "conversation_keys": _normalize_conversation_keys(conversation_keys),

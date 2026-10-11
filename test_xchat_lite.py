@@ -19,7 +19,7 @@ import xchat_lite
 
 real_keyring_lookup = xchat_lite._keyring
 
-STOP, BOOL, STRING, STRUCT = 0, 2, 11, 12
+STOP, BOOL, I32, I64, STRING, STRUCT, LIST = 0, 2, 8, 10, 11, 12, 15
 
 # chatxdk SDK test vectors: test-only keys for user 1111, a signed self key
 # change for conversation 1111:2222 (key version 1001), and a message
@@ -75,6 +75,22 @@ def _text(fid: int, value: str) -> bytes:
     return _field(STRING, fid, _string(value))
 
 
+def _i32(fid: int, value: int) -> bytes:
+    return _field(I32, fid, struct.pack(">i", value))
+
+
+def _i64(fid: int, value: int) -> bytes:
+    return _field(I64, fid, struct.pack(">q", value))
+
+
+def _bool(fid: int, value: bool) -> bytes:
+    return _field(BOOL, fid, b"\x01" if value else b"\x00")
+
+
+def _list(fid: int, *items: bytes) -> bytes:
+    return _field(LIST, fid, struct.pack(">bi", STRUCT, len(items)) + b"".join(items))
+
+
 def _variant(fid: int, *fields: bytes) -> bytes:
     """A union whose variant `fid` is a struct with these fields."""
     return _struct(_field(STRUCT, fid, _struct(*fields)))
@@ -126,6 +142,40 @@ def unsigned_encrypted_message_event(text: str) -> str:
         conversation_key_version="1001",
     )
     return _message_event(base64.b64decode(payload.encrypted_content), SENDER_ID, "1111:2222")
+
+
+def entry_holder(variant: int, *fields: bytes) -> bytes:
+    """A MessageEntryHolder whose contents are MessageEntryContents variant `variant`."""
+    return _struct(_field(STRUCT, 1, _variant(variant, *fields)))
+
+
+def plain_entry_event(variant: int, *fields: bytes) -> str:
+    """An unencrypted message holding MessageEntryContents variant `variant`."""
+    create = _struct(_field(STRING, 100, _string(entry_holder(variant, *fields))))
+    return _message_event(create, "222", "111-222")
+
+
+def seal(key: bytes, plaintext: bytes) -> bytes:
+    """An XSalsa20-Poly1305 box: nonce, tag, ciphertext."""
+    nonce = bytes(range(24))
+    stream = xchat_lite._xsalsa20_stream(key, nonce, 32 + len(plaintext))
+    ciphertext = bytes(p ^ k for p, k in zip(plaintext, stream[32:]))
+    return nonce + xchat_lite._poly1305(stream[:32], ciphertext) + ciphertext
+
+
+def encrypted_entry_thread(variant: int, *fields: bytes) -> dict:
+    """The vector key change and an unsigned message whose entry is sealed under its key."""
+    contents = seal(base64.b64decode(VECTORS["conversation_key"]), entry_holder(variant, *fields))
+    create = _struct(_field(STRING, 100, _string(contents)), _text(101, "1001"))
+    return {
+        "conversation_key_events": [VECTORS["key_change_event"]],
+        "events": [_message_event(create, SENDER_ID, "1111:2222")],
+    }
+
+
+def media(media_type: int, *fields: bytes) -> bytes:
+    """A MessageAttachment holding a media attachment of this MediaType."""
+    return _variant(1, _text(1, "hash-key"), _i32(3, media_type), *fields)
 
 
 def mcp_key(**overrides) -> dict:
@@ -200,6 +250,10 @@ def run_decrypt(payload) -> dict:
 
 def summary(result: dict) -> list[tuple[str, str, str]]:
     return [(m["event"]["type"], m["status"], m["text"]) for m in result["messages"]]
+
+
+def texts(result: dict) -> list[str]:
+    return [m["text"] for m in result["messages"]]
 
 
 PIN = "test-pin"
@@ -399,13 +453,13 @@ class VerificationPolicyTest(unittest.TestCase):
         )
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
 
-    def test_message_that_cannot_be_decrypted_has_no_text(self):
+    def test_message_that_cannot_be_decrypted_gets_placeholder_text(self):
         text = "needs a conversation key"
         result = run_decrypt({"events": [unsigned_encrypted_message_event(text)]})
 
         self.assertNotIn(text, json.dumps(result))
         [message] = result["messages"]
-        self.assertEqual(message["text"], "")
+        self.assertEqual(message["text"], "[could not decrypt this message]")
         self.assertEqual(message["status"], "unverified")
         self.assertEqual(message["event"]["sender_id"], SENDER_ID)
         self.assertTrue(message["error"])
@@ -425,6 +479,160 @@ class VerificationPolicyTest(unittest.TestCase):
             ],
         )
         self.assertEqual(result["unverified_senders"], [SENDER_ID])
+
+
+class DisplayTextTest(unittest.TestCase):
+    def test_attachments_are_labeled_before_the_caption(self):
+        cases = {
+            "[photo] look": (_text(1, "look"), _list(3, media(1))),
+            "[video]": (_list(3, media(3)),),
+            "[file: report.pdf]": (_text(1, ""), _list(3, media(5, _text(6, "report.pdf")))),
+            "[post: https://x.com/a/status/1]": (
+                _list(3, _variant(2, _text(1, "1"), _text(2, "https://x.com/a/status/1"))),
+            ),
+            "see https://ex.com": (_text(1, "see https://ex.com"), _list(3, _variant(3, _text(1, "https://ex.com")))),
+            "[payment: Sent $5]": (_list(3, _variant(5, _text(1, "Sent $5"))),),
+            "[forwarded] hello": (_field(STRUCT, 6, _struct(_text(1, "hello"))),),
+            "[empty message]": (),
+        }
+        for expected, fields in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(texts(run_decrypt({"events": [plain_entry_event(1, *fields)]})), [expected])
+
+    def test_reactions_and_edits_name_the_message(self):
+        result = run_decrypt(
+            {
+                "events": [
+                    plain_entry_event(2, _text(1, "2001"), _text(2, "❤️")),
+                    plain_entry_event(3, _text(1, "2001"), _text(2, "❤️")),
+                    plain_entry_event(4, _text(1, "2001"), _text(2, "see you at 6")),
+                ]
+            }
+        )
+
+        self.assertEqual(
+            texts(result),
+            ["reacted ❤️ to 2001", "removed reaction ❤️ from 2001", "edited 2001: see you at 6"],
+        )
+
+    def test_calls_and_accepted_requests_are_readable(self):
+        sent_at = _i64(1, 1_760_140_800_000)
+        result = run_decrypt(
+            {
+                "events": [
+                    plain_entry_event(16, _bool(1, False)),
+                    plain_entry_event(16, _bool(1, True)),
+                    plain_entry_event(10, sent_at, _i64(2, 65), _bool(3, False)),
+                    plain_entry_event(11, sent_at, _bool(2, True)),
+                    plain_entry_event(13),
+                ]
+            }
+        )
+
+        self.assertEqual(
+            texts(result),
+            [
+                "[call started]",
+                "[audio call started]",
+                "[call ended, 1m 5s]",
+                "[missed audio call]",
+                "[accepted the message request]",
+            ],
+        )
+        self.assertEqual(result["messages"][2]["event"]["content"]["content_type"], "CallEnded")
+
+    def test_encrypted_call_and_request_entries_are_opened_again(self):
+        call = encrypted_entry_thread(10, _i64(1, 1_760_140_800_000), _i64(2, 3725), _bool(3, True))
+        [_, message] = run_decrypt(call)["messages"]
+
+        self.assertEqual(message["text"], "[audio call ended, 1h 2m 5s]")
+        self.assertEqual(
+            message["event"]["content"],
+            {"content_type": "CallEnded", "audio_only": True, "duration_seconds": 3725},
+        )
+        self.assertEqual(texts(run_decrypt(encrypted_entry_thread(13)))[-1], "[accepted the message request]")
+
+    def test_grok_messages_and_replies_are_readable(self):
+        photo = _string(_struct(_list(1, media(1))))
+        result = run_decrypt(
+            {
+                "events": [
+                    _event(_variant(15, _field(STRING, 1, _string(b"\x00sealed")), _text(5, "1001"))),
+                    _event(_variant(16, _text(6, "Here is the summary.\n"), _text(10, "2001"))),
+                    _event(_variant(16, _text(6, "Look"), _field(STRING, 7, photo))),
+                    _event(_variant(16, _field(STRING, 1, _string(b"\x01sealed")))),
+                ]
+            }
+        )
+
+        self.assertEqual(
+            [(m["event"]["type"], m["text"]) for m in result["messages"]],
+            [
+                ("GrokMessage", "[message to Grok]"),
+                ("GrokResponse", "Here is the summary.\n"),
+                ("GrokResponse", "[photo] Look"),
+                ("GrokResponse", "[encrypted Grok reply]"),
+            ],
+        )
+        self.assertEqual(result["messages"][1]["event"]["replying_to_sequence_id"], "2001")
+
+    def test_pins_and_unpins_name_the_message(self):
+        result = run_decrypt(
+            {
+                "events": [
+                    unencrypted_message_event("meet at 5"),
+                    _event(_variant(17, _field(STRING, 1, _string(b"sealed")), _text(3, "1001"), _i64(4, 2001))),
+                    _event(_variant(18, _list(3, _struct(_i64(1, 2002), _i64(2, 2001))))),
+                    _event(_variant(18, _i64(1, 2002), _i64(2, 2001))),
+                    _event(_variant(19)),
+                ]
+            }
+        )
+
+        self.assertEqual(
+            summary(result)[1:],
+            [
+                ("PinMessage", "unverified", "pinned message 2001: meet at 5"),
+                ("UnpinMessage", "unencrypted", "unpinned message 2001"),
+                ("UnpinMessage", "unencrypted", "unpinned message 2001"),
+                ("PinKeysUpdate", "unencrypted", "[pinned message keys updated]"),
+            ],
+        )
+
+
+class PlaceholderTest(unittest.TestCase):
+    def test_every_event_that_cannot_be_decoded_gets_a_row(self):
+        mistyped_settings = _event(_variant(9, _field(STRUCT, 1, _variant(1, _text(1, "not a duration")))))
+        truncated = base64.b64encode(base64.b64decode(unencrypted_message_event("cut"))[:-5]).decode()
+        result = run_decrypt({"events": [mistyped_settings, truncated, {"encoded_event": None}]})
+
+        self.assertEqual(
+            [(m["event"]["type"], m["text"], m["status"]) for m in result["messages"]],
+            [
+                ("SettingsChange", "[could not read this event]", "unverified"),
+                ("Unknown", "[could not read this event]", "unverified"),
+                ("Unknown", "[could not read this event]", "unverified"),
+            ],
+        )
+        self.assertEqual([m["error"] for m in result["messages"]], [result["errors"][i] for i in ("0", "1", "2")])
+        self.assertEqual(result["errors"]["2"], "not a base64 event")
+
+
+class OpenBoxTest(unittest.TestCase):
+    def test_opens_what_the_sdk_encrypts(self):
+        key = bytes(range(32))
+        for text in ("", "a", "x" * 63, "y" * 64, "✓ " * 100):
+            with self.subTest(length=len(text)):
+                box = base64.b64decode(chat_xdk.Chat().encrypt(text, key))
+                self.assertEqual(xchat_lite._open_box(key, box), text.encode())
+
+    def test_rejects_a_wrong_key_or_a_tampered_box(self):
+        key = bytes(range(32))
+        box = bytearray(base64.b64decode(chat_xdk.Chat().encrypt("hello", key)))
+
+        self.assertIsNone(xchat_lite._open_box(bytes(32), bytes(box)))
+        box[-1] ^= 1
+        self.assertIsNone(xchat_lite._open_box(key, bytes(box)))
 
 
 class SavedKeyTest(unittest.TestCase):
