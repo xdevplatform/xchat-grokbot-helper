@@ -993,7 +993,9 @@ def _media_from_result(doc: Any) -> bytes:
             try:
                 inner = json.loads(texts[0])
             except ValueError:
-                raise ValueError(f"download failed: {texts[0][:200]}") from None
+                if doc.get("isError"):
+                    raise ValueError(f"download failed: {texts[0][:200]}") from None
+                raise ValueError("not a chat_media_download result") from None
             return _media_from_result(inner)
     if isinstance(doc, dict) and doc.get("encoding") == "base64" and isinstance(doc.get("data"), str):
         data = base64.b64decode(doc["data"], validate=True)
@@ -1091,7 +1093,9 @@ def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[s
         try:
             found = _media_message(decrypted["messages"], media_hash_key)
             if found is None:
-                raise ValueError("no decrypted message references this media_hash_key; include its event")
+                failed = len(decrypted["errors"])
+                hint = f" ({failed} event(s) could not be decrypted)" if failed else ""
+                raise ValueError(f"no decrypted message references this media_hash_key; include its event{hint}")
             event, attachment = found
             downloaded = _downloaded_media(str(request.get("input") or ""))
             version = event.get("key_version")

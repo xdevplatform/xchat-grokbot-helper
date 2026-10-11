@@ -925,8 +925,11 @@ class DecryptMediaTest(unittest.TestCase):
     def test_each_media_that_cannot_be_decrypted_gets_an_error(self):
         blob = chat_xdk.Chat().encrypt_stream(PNG, self.key)
         forbidden = {"title": "Forbidden", "detail": "Missing required OAuth2 scopes: media.write"}
+        too_large = {**tool_result("Failed to read response body: length limit exceeded"), "isError": True}
         media = [
             {"media_hash_key": "AGgkIbPRTG", "input": self.saved("403.json", tool_result(forbidden))},
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("too-large.json", too_large)},
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("lossy.json", tool_result("\ufffdPNG\ufffd"))},
             {
                 "media_hash_key": "AGgkIbPRTG",
                 "input": self.saved("wrong-key.json", tool_text(chat_xdk.Chat().encrypt_stream(PNG, os.urandom(32)))),
@@ -936,10 +939,18 @@ class DecryptMediaTest(unittest.TestCase):
         ]
         result = self.run_media([encrypted_media_message("AGgkIbPRTG")], media, "--out-dir", str(self.tmp))
         self.assertEqual(result["media"], [])
-        self.assertEqual(result["errors"]["0"], "download failed: Missing required OAuth2 scopes: media.write")
-        self.assertIn("Decryption failed", result["errors"]["1"])
-        self.assertEqual(result["errors"]["2"], f"download holds {len(blob)} bytes, not {len(blob) + 1}")
-        self.assertIn("no decrypted message references this media_hash_key", result["errors"]["3"])
+        self.assertEqual(
+            result["errors"],
+            {
+                "0": "download failed: Missing required OAuth2 scopes: media.write",
+                "1": "download failed: Failed to read response body: length limit exceeded",
+                "2": "not a chat_media_download result",
+                "3": result["errors"]["3"],
+                "4": f"download holds {len(blob)} bytes, not {len(blob) + 1}",
+                "5": "no decrypted message references this media_hash_key; include its event",
+            },
+        )
+        self.assertIn("Decryption failed", result["errors"]["3"])
         self.assertEqual(list(self.tmp.glob("AGgkIbPRTG*")), [])
 
     def test_media_of_an_unencrypted_message_is_written_as_downloaded(self):
