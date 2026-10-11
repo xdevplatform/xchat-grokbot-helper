@@ -743,6 +743,42 @@ class OpenBoxTest(unittest.TestCase):
         self.assertIsNone(xchat_lite._open_box(key, bytes(box)))
 
 
+def sent_entities(fields: dict) -> list[tuple[int, int, int]]:
+    """(start, end, content variant) for each entity in an encrypt payload's message contents."""
+    key = base64.b64decode(VECTORS["conversation_key"])
+    event, _ = xchat_lite._thrift_value(base64.b64decode(fields["encoded_message_create_event"]), 0, STRUCT)
+    contents, _ = xchat_lite._thrift_value(xchat_lite._open_box(key, event[100]), 0, STRUCT)
+    contents = contents[1][1]
+    return [(e[1], e[2], next(iter(e[3]))) for e in contents.get(2, [])]
+
+
+def encrypt(text: str) -> dict:
+    chat = chat_xdk.Chat()
+    chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
+    chat.set_identity("1111", "1")
+    key = base64.b64decode(VECTORS["conversation_key"])
+    return xchat_lite._encrypt_payload(chat, "1111-2222", text, conversation_key=key, conversation_key_version="1001")
+
+
+class UrlEntityTest(unittest.TestCase):
+    def test_urls_are_found_in_utf16_units(self):
+        self.assertEqual(xchat_lite._url_entities("see https://x.com/a."), [(4, 19, "url")])
+        self.assertEqual(xchat_lite._url_entities("𝕏 https://x.com"), [(3, 16, "url")])
+        self.assertEqual(xchat_lite._url_entities("[docs](https://docs.x.com)"), [(7, 25, "url")])
+        self.assertEqual(xchat_lite._url_entities("(https://en.wikipedia.org/wiki/A_(b))"), [(1, 36, "url")])
+        self.assertEqual(xchat_lite._url_entities("no links, just https:// and x.com"), [])
+
+    def test_encrypt_marks_urls_as_link_entities(self):
+        text = "Ship it: https://github.com/x/y/pull/1 and 𝕏 https://docs.x.com"
+        fields = encrypt(text)
+        # 4 is RichTextContent.url.
+        self.assertEqual(sent_entities(fields), [(9, 38, 4), (46, 64, 4)])
+
+    def test_text_without_urls_has_no_entities(self):
+        fields = encrypt("hello")
+        self.assertEqual(sent_entities(fields), [])
+
+
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()

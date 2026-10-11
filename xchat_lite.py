@@ -29,6 +29,7 @@ CLI:
                           # public_keys entries: user_id, public_key (identity), key_version
                           # stdout: add_conversation_keys body fields (+ optional _local_conversation_key)
   encrypt CONV_ID TEXT    # needs conversation key in cache OR pass --from-decrypt/--from-prepare
+                          # encrypt and session-encrypt mark http(s) URLs as link entities
   session-encrypt         # stdin JSON: warm keys then encrypt in ONE process
                           # {
                           #   "conversation_id": "...",
@@ -47,6 +48,7 @@ import binascii
 import hmac
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -308,7 +310,34 @@ def _prep_to_add_keys(prep: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_URL = re.compile(r"https?://[^\s<>\"'`]+")
+_URL_TRAILING = ".,;:!?'\")]}*_"
+
+
+def _url_entities(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, "url") for each http(s) URL, in UTF-16 code units, as the X apps mark links.
+
+    Trailing punctuation isn't part of the link; a closing parenthesis is when it balances one
+    in the URL.
+    """
+    spans = []
+    for match in _URL.finditer(text):
+        url = match.group(0)
+        while url and url[-1] in _URL_TRAILING:
+            if url[-1] == ")" and url.count("(") >= url.count(")"):
+                break
+            url = url[:-1]
+        if len(url) <= len("https://"):
+            continue
+        start = len(text[: match.start()].encode("utf-16-le")) // 2
+        spans.append((start, start + len(url.encode("utf-16-le")) // 2, "url"))
+    return spans
+
+
 def _encrypt_payload(chat: Chat, conversation_id: str, text: str, **kwargs: Any) -> dict[str, str]:
+    # Without entities X Chat shows URLs as plain text.
+    if "entities" not in kwargs:
+        kwargs["entities"] = _url_entities(text) or None
     payload = chat.encrypt_message(conversation_id, text, **kwargs)
     return {
         "message_id": payload.message_id,
