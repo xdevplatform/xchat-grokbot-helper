@@ -109,27 +109,40 @@ def _fresh_event_id() -> str:
 _fresh_event_id.n = 0
 
 
+def _fresh_sequence_id() -> str:
+    _fresh_sequence_id.n += 1
+    return str(3000 + _fresh_sequence_id.n)
+
+
+_fresh_sequence_id.n = 0
+
+
 def _event(
     detail: bytes,
     sender_id: str = "222",
     conversation_id: str = "111-222",
     event_id: str | None = None,
+    sequence_id: str | None = None,
 ) -> str:
     """Base64 Thrift MessageEvent with this detail union, without a signature.
 
-    Each call gets its own id unless one is passed. An empty id is left off.
+    Each call gets its own sequence id and message id unless one is passed.
+    An empty id is left off.
     """
     if event_id is None:
         event_id = _fresh_event_id()
+    if sequence_id is None:
+        sequence_id = _fresh_sequence_id()
     fields = [
-        _field(STRING, 1, _string("2001")),
         _field(STRING, 3, _string(sender_id)),
         _field(STRING, 4, _string(conversation_id)),
         _field(STRING, 6, _string("1700000000001")),
         _field(STRUCT, 7, detail),
     ]
+    if sequence_id:
+        fields.insert(0, _field(STRING, 1, _string(sequence_id)))
     if event_id:
-        fields.insert(1, _field(STRING, 2, _string(event_id)))
+        fields.insert(1 if sequence_id else 0, _field(STRING, 2, _string(event_id)))
     event = _struct(*fields)
     return base64.b64encode(event).decode()
 
@@ -139,14 +152,22 @@ def _message_event(
     sender_id: str,
     conversation_id: str,
     event_id: str | None = None,
+    sequence_id: str | None = None,
 ) -> str:
     return _event(
-        _struct(_field(STRUCT, 1, create_event)), sender_id, conversation_id, event_id
+        _struct(_field(STRUCT, 1, create_event)),
+        sender_id,
+        conversation_id,
+        event_id,
+        sequence_id,
     )
 
 
 def unencrypted_message_event(
-    text: str, sender_id: str = "222", event_id: str | None = None
+    text: str,
+    sender_id: str = "222",
+    event_id: str | None = None,
+    sequence_id: str | None = None,
 ) -> str:
     """A message with plaintext contents and no conversation key version."""
     message_contents = _struct(_field(STRING, 1, _string(text)))
@@ -155,7 +176,7 @@ def unencrypted_message_event(
         _field(STRING, 100, _string(entry_holder)),
         _field(BOOL, 102, b"\x01"),
     )
-    return _message_event(create_event, sender_id, "111-222", event_id)
+    return _message_event(create_event, sender_id, "111-222", event_id, sequence_id)
 
 
 def unsigned_encrypted_message_event(text: str) -> str:
@@ -418,11 +439,25 @@ class SkippedSigningKeyTest(unittest.TestCase):
 
 
 class VerificationPolicyTest(unittest.TestCase):
-    def test_duplicate_event_ids_keep_the_first(self):
-        first = unencrypted_message_event("first", event_id="same")
-        later = unencrypted_message_event("later", event_id="same")
-        other = unencrypted_message_event("other", event_id="other")
-        no_id = unencrypted_message_event("nameless", event_id="")
+    def test_distinct_events_sharing_a_message_id_all_stay(self):
+        shared = "client-request"
+        result = run_decrypt(
+            {
+                "conversation_key_events": [
+                    unencrypted_message_event("key-a", event_id=shared, sequence_id="20"),
+                    unencrypted_message_event("key-b", event_id=shared, sequence_id="21"),
+                ],
+                "events": [
+                    unencrypted_message_event("one", event_id=shared, sequence_id="10"),
+                    unencrypted_message_event("two", event_id=shared, sequence_id="11"),
+                    unencrypted_message_event("three", event_id=shared, sequence_id="12"),
+                ],
+            }
+        )
+
+        self.assertEqual(texts(result), ["key-a", "key-b", "one", "two", "three"])
+
+    def test_same_sequence_id_collapses_to_the_first(self):
         result = run_decrypt(
             {
                 "conversation_key_events": [
@@ -430,14 +465,10 @@ class VerificationPolicyTest(unittest.TestCase):
                     VECTORS["key_change_event"],
                 ],
                 "events": [
-                    VECTORS["key_change_event"],
+                    unencrypted_message_event("first", event_id="a", sequence_id="7"),
+                    unencrypted_message_event("later", event_id="b", sequence_id="7"),
                     VECTORS["message_event"],
                     {"encoded_event": VECTORS["message_event"]},
-                    first,
-                    later,
-                    other,
-                    no_id,
-                    no_id,
                 ],
                 "signing_keys": {"data": [mcp_key()]},
             }
@@ -447,24 +478,35 @@ class VerificationPolicyTest(unittest.TestCase):
             summary(result),
             [
                 ("KeyChange", "verified", ""),
-                ("Message", "verified", MESSAGE_TEXT),
                 ("Message", "unencrypted", "first"),
-                ("Message", "unencrypted", "other"),
-                ("Message", "unencrypted", "nameless"),
-                ("Message", "unencrypted", "nameless"),
+                ("Message", "verified", MESSAGE_TEXT),
             ],
         )
 
+    def test_events_without_a_sequence_id_dedupe_on_the_encoded_event(self):
+        one = unencrypted_message_event("alpha", event_id="m1", sequence_id="")
+        other = unencrypted_message_event("beta", event_id="m1", sequence_id="")
+        result = run_decrypt(
+            {
+                "conversation_key_events": [one, one, other],
+                "events": [one, other, other],
+            }
+        )
+
+        self.assertEqual(texts(result), ["alpha", "beta", "alpha", "beta"])
+
     def test_every_event_is_accepted_in_one_pass(self):
         events = [
-            VECTORS["key_change_event"],
             VECTORS["message_event"],
             unencrypted_message_event("plain"),
         ]
         chat = RecordingChat("{}")
-        xchat_lite._decrypt(chat, {"events": events})
+        xchat_lite._decrypt(
+            chat,
+            {"conversation_key_events": [VECTORS["key_change_event"]], "events": events},
+        )
 
-        self.assertEqual(chat.batches, [(False, events)])
+        self.assertEqual(chat.batches, [(False, [VECTORS["key_change_event"], *events])])
 
     def test_unsigned_group_description_change_is_returned(self):
         event = _event(_group_change(14, _text(1, "about"), _text(2, "1007")))
@@ -646,7 +688,7 @@ class DisplayTextTest(unittest.TestCase):
         result = run_decrypt(
             {
                 "events": [
-                    unencrypted_message_event("meet at 5"),
+                    unencrypted_message_event("meet at 5", sequence_id="2001"),
                     _event(_variant(17, _field(STRING, 1, _string(b"sealed")), _text(3, "1001"), _i64(4, 2001))),
                     _event(_variant(18, _list(3, _struct(_i64(1, 2002), _i64(2, 2001))))),
                     _event(_variant(18, _i64(1, 2002), _i64(2, 2001))),

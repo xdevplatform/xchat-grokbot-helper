@@ -538,17 +538,20 @@ def _event_b64(item: Any) -> str:
 
 
 def _dedupe_events(items: list[Any]) -> list[Any]:
-    """Keep the first item for each event id. Items with no id stay."""
-    seen: set[str] = set()
+    """Keep the first item for each sequence id.
+
+    An event with no sequence id is kept once per exact encoded string.
+    """
+    seen: set[tuple[str, str]] = set()
     kept: list[Any] = []
     for item in items:
         event_b64 = _event_b64(item)
         info = _event_info(event_b64) if event_b64 else None
-        event_id = info["id"] if info else ""
-        if event_id and event_id in seen:
+        sequence_id = info["sequence_id"] if info else ""
+        key = ("sequence", sequence_id) if sequence_id else ("event", event_b64)
+        if key in seen:
             continue
-        if event_id:
-            seen.add(event_id)
+        seen.add(key)
         kept.append(item)
     return kept
 
@@ -883,13 +886,13 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     empty for a message. Event and entry types the SDK returns as Unknown,
     such as Grok replies, pins and calls, are decoded here. Every event that
     can't be decoded still gets a row, with placeholder text and an error.
-    A repeated event id is kept once, the first copy.
+    Each sequence id is kept once, the first copy, for key events and for
+    messages. An event with no sequence id is kept once per exact encoded string.
     """
     if isinstance(payload, list):
         payload = {"events": payload}
-    raw_events = _dedupe_events(
-        list(payload.get("conversation_key_events") or [])
-        + list(payload.get("events") or payload.get("encoded_events") or [])
+    raw_events = _dedupe_events(list(payload.get("conversation_key_events") or [])) + _dedupe_events(
+        list(payload.get("events") or payload.get("encoded_events") or [])
     )
     signing_keys, skipped = _signing_keys(chat, payload.get("signing_keys"))
     if signing_keys:
