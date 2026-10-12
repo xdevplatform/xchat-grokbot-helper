@@ -10,6 +10,8 @@ It is meant to sit next to an agent skill (or any app) that already has the XCha
 
 A message's `text` is never empty: `[photo] caption`, `[file: report.pdf]`, `reacted ❤️ to 2001`, `edited 2001: new text`, `[call ended, 1m 5s]`, `[accepted the message request]`. Grok replies keep their plaintext text, and Grok messages, pins and unpins come out readable even though `chatxdk` 0.5.0 returns them as `Unknown`. Calls and other entries it returns as `Unknown` are read from the event, opening encrypted contents again with the conversation key. An event that can't be decoded gets a row with placeholder text and an `error`.
 
+System events keep empty `text` and add a `notice`, such as `[added 333, 444]`, `[renamed the group to …]`, `[deleted 2 messages for everyone]`, `[set disappearing messages to 24h]` or `[conversation key changed]`. Encrypted group titles, avatars and descriptions are opened with the conversation key into `decrypted_title`, `decrypted_avatar_url` and `description` on the event's `change`. Messages sent with a per-message key (`contents_encryption_version` 1), which `chatxdk` 0.5.0 can't open, are decrypted here and come back `unverified`.
+
 ## Install
 
 ```bash

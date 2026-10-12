@@ -1,5 +1,7 @@
 import argparse
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -724,6 +726,95 @@ class PlaceholderTest(unittest.TestCase):
         )
         self.assertEqual([m["error"] for m in result["messages"]], [result["errors"][i] for i in ("0", "1", "2")])
         self.assertEqual(result["errors"]["2"], "not a base64 event")
+
+
+def hkdf32(secret: bytes, salt: bytes, info: bytes) -> bytes:
+    """First 32 bytes of RFC 5869 HKDF-SHA256."""
+    prk = hmac.new(salt, secret, hashlib.sha256).digest()
+    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+
+
+def _strings(fid: int, *values: str) -> bytes:
+    return _field(LIST, fid, struct.pack(">bi", STRING, len(values)) + b"".join(_string(v) for v in values))
+
+
+def message_key_thread(message_id: str = "mid-1", key_message_id: str = "mid-1") -> dict:
+    """The vector key change and a message sealed with its per-message key (contents_encryption_version 1)."""
+    key = hkdf32(base64.b64decode(VECTORS["conversation_key"]), b"xchat-message-key", f"{SENDER_ID}:{key_message_id}".encode())
+    contents = seal(key, entry_holder(1, _text(1, "per-message key"), _list(3, media(1))))
+    create = _struct(_field(STRING, 100, _string(contents)), _text(101, "1001"), _field(6, 112, struct.pack(">h", 1)))
+    return {
+        "conversation_key_events": [VECTORS["key_change_event"]],
+        "events": [_message_event(create, SENDER_ID, "1111:2222", event_id=message_id)],
+    }
+
+
+class MessageKeyTest(unittest.TestCase):
+    def test_hkdf_matches_rfc5869(self):
+        okm = hkdf32(bytes([0x0B] * 22), bytes(range(13)), bytes(range(0xF0, 0xFA)))
+        self.assertEqual(okm.hex(), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf")
+
+    def test_message_sent_with_a_per_message_key_is_readable(self):
+        result = run_decrypt(message_key_thread())
+        message = result["messages"][-1]
+        self.assertEqual(result["errors"], {})
+        self.assertEqual((message["status"], message["text"]), ("unverified", "[photo] per-message key"))
+        self.assertEqual(message["event"]["contents_encryption_version"], 1)
+        self.assertEqual(message["event"]["id"], "mid-1")
+
+    def test_wrong_message_key_still_gets_a_placeholder(self):
+        result = run_decrypt(message_key_thread(key_message_id="other"))
+        self.assertEqual(result["messages"][-1]["text"], "[could not decrypt this message]")
+        self.assertIn("1", result["errors"])
+
+
+class SystemEventTest(unittest.TestCase):
+    def notices(self, *details, keyed=False) -> list:
+        payload = {"events": [_event(d, sender_id=SENDER_ID, conversation_id="g1") for d in details]}
+        if keyed:
+            payload["conversation_key_events"] = [VECTORS["key_change_event"]]
+        return [(m["event"]["type"], m["text"], m.get("notice")) for m in run_decrypt(payload)["messages"]]
+
+    def test_encrypted_group_title_and_description_are_opened(self):
+        key = base64.b64decode(VECTORS["conversation_key"])
+        title, about = chat_xdk.Chat().encrypt("Secret Club", key), chat_xdk.Chat().encrypt("be nice", key)
+        payload = {
+            "conversation_key_events": [VECTORS["key_change_event"]],
+            "events": [
+                _event(_group_change(2, _text(1, title), _text(2, "1001")), sender_id=SENDER_ID),
+                _event(_group_change(14, _text(1, about), _text(2, "1001")), sender_id=SENDER_ID),
+            ],
+        }
+        rows = run_decrypt(payload)["messages"][1:]
+        self.assertEqual(rows[0]["event"]["change"]["new_title"], title)
+        self.assertEqual(rows[0]["event"]["change"]["decrypted_title"], "Secret Club")
+        self.assertEqual(rows[1]["event"]["change"], {"change_type": "DescriptionChanged", "description": "be nice"})
+        self.assertEqual([r["notice"] for r in rows], ["[renamed the group to Secret Club]", "[changed the group description: be nice]"])
+        self.assertEqual([r["text"] for r in rows], ["", ""])
+
+    def test_system_events_get_a_notice(self):
+        self.assertEqual(
+            self.notices(
+                _group_change(5, _strings(1, "333", "444"), _strings(2, "111", "333", "444")),
+                _variant(7, _strings(1, "3001", "3002"), _i32(2, 2)),
+                _variant(9, _field(STRUCT, 1, _variant(1, _i64(1, 86400000), _bool(2, False)))),
+                _variant(8),
+            ),
+            [
+                ("GroupChange", "", "[added 333, 444]"),
+                ("MessageDeleted", "", "[deleted 2 messages for everyone]"),
+                ("SettingsChange", "", "[set disappearing messages to 24h]"),
+                ("ConversationDeleted", "", "[deleted the conversation]"),
+            ],
+        )
+
+    def test_messages_and_receipts_get_no_notice(self):
+        result = run_decrypt({"events": [unencrypted_message_event("hi"), _event(_variant(6))]})
+        self.assertEqual([m.get("notice") for m in result["messages"]], [None, None])
+
+    def test_x_number_entry_is_labeled(self):
+        result = run_decrypt(encrypted_entry_thread(17))
+        self.assertEqual(result["messages"][-1]["text"], "[used an X Number]")
 
 
 class OpenBoxTest(unittest.TestCase):
