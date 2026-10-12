@@ -779,6 +779,12 @@ class UrlEntityTest(unittest.TestCase):
         self.assertEqual(sent_entities(fields), [])
 
 
+def marked(text: str, kind: str) -> list[str]:
+    """Each `kind` entity _text_entities finds, without its @ or #, as twitter-text's conformance lists them."""
+    units = text.encode("utf-16-le")
+    return [units[2 * s + 2 : 2 * e].decode("utf-16-le") for s, e, k in xchat_lite._text_entities(text) if k == kind]
+
+
 class RichTextEntityTest(unittest.TestCase):
     def test_mentions_tags_and_emails_are_found(self):
         text = "hi @santi_m #XChat $TSLA, a.b@x.ai 𝕏 @ab"
@@ -790,6 +796,44 @@ class RichTextEntityTest(unittest.TestCase):
     def test_urls_win_and_lookalikes_are_skipped(self):
         self.assertEqual(xchat_lite._text_entities("https://x.com/#a?u=@me"), [(0, 22, "url")])
         self.assertEqual(xchat_lite._text_entities("C# #123 a@b price $5 &#39;"), [])
+
+    def test_hashtags_are_skipped_not_shortened(self):
+        # twitter-text's end rule: a tag that runs into # or :// isn't a hashtag.
+        for text in ("#love#instagood", "#tag://x", "#ab＃cd"):
+            with self.subTest(text=text):
+                self.assertEqual(xchat_lite._text_entities(text), [])
+
+    def test_twitter_text_conformance_cases(self):
+        # From twitter-text's conformance/extract.yml.
+        mentions = {
+            "RT@username RT:@mention RT @test": ["username", "mention", "test"],
+            "rt@username rt:@mention rt @test": ["username", "mention", "test"],
+            "@aliceìnheiro something something": [],
+        }
+        hashtags = {
+            "#http://twitter.com #https://twitter.com": [],
+            "a \u270c\ufe0f#hashtag here": ["hashtag"],
+            "#महात्मा #महात्मा_१२३४ #१२३४ गांधी": ["महात्मा", "महात्मा_१२३४"],
+            "#বাংলা #ગુજરાતી #ಕನ್ನಡ #മലയാളം #ଓଡ଼ିଆ #ਪੰਜਾਬੀ #සිංහල #தமிழ் #తెలుగు": [
+                "বাংলা", "ગુજરાતી", "ಕನ್ನಡ", "മലയാളം", "ଓଡ଼ିଆ", "ਪੰਜਾਬੀ", "සිංහල", "தமிழ்", "తెలుగు",
+            ],
+            "#ผู้เริ่ม #การเมือง #รายละเอียด #นักท่องเที่ยว #ของขวัญ #สนามบิน #เดินทาง #ประธาน": [
+                "ผู้เริ่ม", "การเมือง", "รายละเอียด", "นักท่องเที่ยว", "ของขวัญ", "สนามบิน", "เดินทาง", "ประธาน",
+            ],
+            "#བོད་སྐད་ #བོད་སྐད": ["བོད་སྐད་", "བོད་སྐད"],
+            "#មហាត្មះគន្ធី #မြင့်မြတ်သော #ຊີວະສາດ": ["មហាត្មះគន្ធី", "မြင့်မြတ်သော", "ຊີວະສາດ"],
+            "#עַל־יְדֵי #וכו׳ #מ״כ": ["עַל־יְדֵי", "וכו׳", "מ״כ"],
+            "#أي\u200cبي\u200cإم #می\u200cخواهم": ["أي\u200cبي\u200cإم", "می\u200cخواهم"],
+            "#ශ්\u200dරීලංකා": ["ශ්\u200dරීලංකා"],
+            "#𖼄𖽑": ["𖼄𖽑"],
+            "#il·lusió": ["il·lusió"],
+            "#メ～テレ ハッシュタグ内で～が認識されず": ["メ～テレ"],
+            "#云々 #学問のすゝめ #いすゞ #各〻 #各〃": ["云々", "学問のすゝめ", "いすゞ", "各〻", "各〃"],
+        }
+        for kind, cases in (("mention", mentions), ("hashtag", hashtags)):
+            for text, expected in cases.items():
+                with self.subTest(text=text):
+                    self.assertEqual(marked(text, kind), expected)
 
     def test_encrypt_marks_each_entity_kind(self):
         fields = encrypt("@xdev #api $X a@b.co https://x.com")

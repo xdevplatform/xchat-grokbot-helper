@@ -58,6 +58,7 @@ import re
 import struct
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -342,10 +343,40 @@ def _url_entities(text: str) -> list[tuple[int, int, str]]:
 
 # Mentions, hashtags and cashtags as twitter-text finds them, and emails with x-android's regex.
 _EMAIL = re.compile(r"[a-zA-Z0-9+._%-]{1,256}@[a-zA-Z0-9][a-zA-Z0-9-]{0,64}(\.[a-zA-Z0-9][a-zA-Z0-9-]{1,63})+")
-_MENTION = re.compile(r"(?<![A-Za-z0-9_!@＠#$%&*])[@＠][A-Za-z0-9_]{1,20}(?![A-Za-z0-9_@＠]|://)")
-_HASHTAG = re.compile(r"(?<![\w&])[#＃]\w*[^\W\d_]\w*(?![#＃]|://)")
+# twitter-text's LATIN_ACCENTS: a mention that runs into one isn't a mention.
+_LATIN_ACCENTS = (
+    r"\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\u0100-\u024f\u0253\u0254\u0256\u0257\u0259\u025b\u0263"
+    r"\u0268\u026f\u0272\u0289\u028b\u02bb\u0300-\u036f\u1e00-\u1eff"
+)
+_MENTION = re.compile(
+    r"(?:(?<![A-Za-z0-9_!@＠#$%&*])|(?<=(?<![A-Za-z0-9_+~.-])[Rr][Tt]))"
+    r"[@＠][A-Za-z0-9_]{1,20}(?![A-Za-z0-9_@＠" + _LATIN_ACCENTS + r"]|://)"
+)
+# twitter-text's other hashtag characters: underscore, ZWNJ, ZWJ and some in-word punctuation.
+_HASHTAG_EXTRAS = "_\u200c\u200d\ua67e\u05be\u05f3\u05f4\uff5e\u301c\u309b\u309c\u30a0\u30fb\u3003\u0f0b\u0f0c\u00b7"
 _CASHTAG = re.compile(r"(?:^|(?<=\s))\$[A-Za-z]{1,6}(?:[._][A-Za-z]{1,2})?(?=$|\s|[!-/:-@\[-`{-~])")
-_TEXT_ENTITY_PATTERNS = (("email", _EMAIL), ("mention", _MENTION), ("hashtag", _HASHTAG), ("cashtag", _CASHTAG))
+
+
+def _hashtag_pattern(text: str) -> re.Pattern[str]:
+    """twitter-text's hashtag regex, with classes built from this text's characters.
+
+    re has no \\p{L}, \\p{M} or \\p{Nd}, and classifying all of Unicode with unicodedata takes
+    about 0.25s, so the classes hold ASCII plus the text's letters, Mn/Mc marks and digits.
+    """
+    letters, digits = "A-Za-z", "0-9"
+    for ch in sorted(set(text)):
+        if ch > "\x7f":
+            category = unicodedata.category(ch)
+            if category[0] == "L" or category in ("Mn", "Mc"):
+                letters += ch
+            elif category == "Nd":
+                digits += ch
+    chars = letters + digits + _HASHTAG_EXTRAS
+    # Hashtag characters in the end check keep the regex from backtracking to a shorter tag.
+    return re.compile(
+        rf"(?:(?<=[\ufe0e\ufe0f])|(?<![&{chars}]))[#＃](?![\ufe0f\u20e3])"
+        rf"[{chars}]*[{letters}][{chars}]*(?![#＃{chars}]|://)"
+    )
 
 
 def _utf16_offset(text: str, index: int) -> int:
@@ -358,7 +389,8 @@ def _text_entities(text: str) -> list[tuple[int, int, str]]:
     URLs win over anything inside them; otherwise the earlier kind in the list wins an overlap.
     """
     spans = list(_url_entities(text))
-    for kind, pattern in _TEXT_ENTITY_PATTERNS:
+    patterns = (("email", _EMAIL), ("mention", _MENTION), ("hashtag", _hashtag_pattern(text)), ("cashtag", _CASHTAG))
+    for kind, pattern in patterns:
         for match in pattern.finditer(text):
             start, end = _utf16_offset(text, match.start()), _utf16_offset(text, match.end())
             if all(end <= s or start >= e for s, e, _ in spans):
