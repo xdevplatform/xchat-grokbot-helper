@@ -21,6 +21,8 @@ CLI:
                           #         or a bare list of event base64 strings
                           # events: data[].encoded_event strings (or the data[] objects)
                           # signing_keys: get_users_public_keys entries for every sender, as returned
+                          # notice: system events (group, settings, deletes, key changes) add one; encrypted
+                          #         group titles/avatars/descriptions are opened into new fields
                           # stdout: messages[], one per event, with display text and status
                           #         verified | unencrypted | unverified (placeholder text and
                           #         an error when an event can't be decoded),
@@ -44,6 +46,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import hmac
 import json
 import os
@@ -693,6 +696,7 @@ _ENTRY_TYPES = {
     14: "Nickname",
     15: "VerifiedStatus",
     16: "CallStarted",
+    17: "XNumberUsed",
 }
 # is_audio_only field id of each call variant.
 _AUDIO_ONLY_FIELDS = {10: 3, 11: 2, 16: 1}
@@ -752,6 +756,7 @@ _CONTENT_TEXT = {
     "ConversationPinned": "[pinned the conversation]",
     "ConversationUnpinned": "[unpinned the conversation]",
     "MessageRequestAccepted": "[accepted the message request]",
+    "XNumberUsed": "[used an X Number]",
 }
 
 
@@ -835,6 +840,178 @@ def _fallback_event(info: dict[str, Any]) -> tuple[dict[str, Any], str]:
     return event, _EVENT_TEXT[kind]
 
 
+def _message_key(conversation_key: bytes, sender_id: str, message_id: str) -> bytes:
+    """Per-message key for contents_encryption_version >= 1, as x-android derives it.
+
+    HKDF-SHA256 of the conversation key, salt "xchat-message-key", info "sender:message_id".
+    """
+    prk = hmac.new(b"xchat-message-key", conversation_key, hashlib.sha256).digest()
+    return hmac.new(prk, f"{sender_id}:{message_id}".encode() + b"\x01", hashlib.sha256).digest()
+
+
+def _text_of(value: Any) -> str:
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else ""
+
+
+def _holder_message(holder: dict[int, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Content and attachments of a MessageEntryHolder, in the SDK's shapes."""
+    variant, fields = _union_variant(holder.get(1))
+    if variant == 1:
+        content: dict[str, Any] = {"content_type": "Text", "text": _text_of(fields.get(1))}
+        forwarded = fields.get(6)
+        if isinstance(forwarded, dict):
+            content["forwarded_message"] = {"message_text": _text_of(forwarded.get(1))}
+        preview = fields.get(4)
+        if isinstance(preview, dict):
+            content["replying_to_preview"] = {
+                "sender_id": str(preview[1]) if isinstance(preview.get(1), int) else None,
+                "message_text": _text_of(preview.get(2)),
+                "replying_to_message_sequence_id": _scalar(preview.get(6)) or None,
+            }
+        items = fields.get(3) if isinstance(fields.get(3), list) else []
+        return content, [_attachment_from_thrift(item) for item in items]
+    if variant in (2, 3):
+        kind = "Reaction" if variant == 2 else "ReactionRemoved"
+        return {"content_type": kind, "emoji": _text_of(fields.get(2)), "target_message_id": _scalar(fields.get(1))}, []
+    if variant == 4:
+        return {"content_type": "Edit", "target_message_id": _scalar(fields.get(1)), "new_text": _text_of(fields.get(2))}, []
+    if variant in (5, 6):
+        return {"content_type": "MarkRead" if variant == 5 else "MarkUnread"}, []
+    return _entry_content(holder), []
+
+
+def _message_key_event(info: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any] | None:
+    """A message sent with a per-message key (contents_encryption_version >= 1), which
+    chatxdk 0.5.0 can't open, decrypted here; None when it isn't one or doesn't open.
+    Its signature isn't checked, so it comes back unverified.
+    """
+    variant, create = _union_variant(info.get("detail"))
+    version, contents = create.get(112), create.get(100)
+    key = keys.get(info.get("key_version") or "")
+    if variant != 1 or not isinstance(version, int) or version < 1 or not isinstance(contents, bytes):
+        return None
+    if not isinstance(key, bytes) or not info.get("sender_id") or not info.get("id"):
+        return None
+    opened = _open_box(_message_key(key, info["sender_id"], info["id"]), contents)
+    if opened is None:
+        return None
+    try:
+        holder, _ = _thrift_value(opened, 0, _THRIFT_STRUCT)
+    except (ValueError, IndexError, struct.error):
+        return None
+    content, attachments = _holder_message(holder)
+    meta = ("sequence_id", "id", "sender_id", "conversation_id", "created_at_msec", "key_version")
+    return {
+        "type": "Message",
+        **{name: info.get(name) for name in meta},
+        "content": content,
+        "attachments": attachments,
+        "verified": False,
+        "contents_encryption_version": version,
+    }
+
+
+def _metadata_text(value: Any, key: Any) -> str | None:
+    """A group title, avatar url or description encrypted under the conversation key, opened."""
+    if not isinstance(key, bytes) or not isinstance(value, (str, bytes)):
+        return None
+    try:
+        box = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    opened = _open_box(key, box)
+    return opened.decode("utf-8", "replace") if opened is not None else None
+
+
+# Encrypted fields of each GroupChange the SDK returns, and the field each opens into.
+_ENCRYPTED_GROUP_FIELDS = {
+    "Created": {"title": "decrypted_title", "avatar_url": "decrypted_avatar_url"},
+    "TitleChanged": {"new_title": "decrypted_title"},
+    "AvatarChanged": {"new_avatar_url": "decrypted_avatar_url"},
+}
+
+
+def _group_change(event: dict[str, Any], info: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
+    """The change with encrypted titles, avatars and descriptions opened, added as new fields."""
+    change = dict(event.get("change") or {})
+    key = keys.get(info.get("key_version") or "")
+    for name, opened_name in _ENCRYPTED_GROUP_FIELDS.get(change.get("change_type"), {}).items():
+        opened = _metadata_text(change.get(name), key)
+        if opened is not None:
+            change[opened_name] = opened
+    _, group_event = _union_variant(info.get("detail"))
+    variant, fields = _union_variant(group_event.get(1))
+    if variant == 14 and change.get("change_type") == "Unknown":
+        description = _scalar(fields.get(1))
+        change["change_type"] = "DescriptionChanged"
+        change["description"] = _metadata_text(description, key) if info.get("key_version") else description
+    return change
+
+
+def _ids(values: Any) -> str:
+    return ", ".join(str(v) for v in values) if isinstance(values, list) else ""
+
+
+def _group_notice(change: dict[str, Any]) -> str:
+    kind = change.get("change_type")
+    title = change.get("decrypted_title")
+    if kind == "Created":
+        return f"[created the group {title}]" if title else "[created the group]"
+    if kind == "TitleChanged":
+        return f"[renamed the group to {title}]" if title else "[renamed the group]"
+    if kind == "DescriptionChanged":
+        description = change.get("description")
+        return f"[changed the group description: {description}]" if description else "[changed the group description]"
+    labels = {
+        "AvatarChanged": "[changed the group photo]",
+        "AdminsAdded": f"[made {_ids(change.get('admin_ids'))} admin]",
+        "AdminsRemoved": f"[removed {_ids(change.get('admin_ids'))} as admin]",
+        "MembersAdded": f"[added {_ids(change.get('member_ids'))}]",
+        "MembersRemoved": f"[removed {_ids(change.get('member_ids'))}]",
+        "InviteEnabled": "[turned on the invite link]",
+        "InviteDisabled": "[turned off the invite link]",
+        "JoinRequested": f"[{change.get('user_id')} asked to join]",
+        "JoinRejected": f"[declined join requests from {_ids(change.get('user_ids'))}]",
+    }
+    return labels.get(kind, "[changed the group]")
+
+
+_SETTING_NOTICES = {
+    "MessageDurationRemoved": "[turned off disappearing messages]",
+    "Muted": "[muted the conversation]",
+    "Unmuted": "[unmuted the conversation]",
+    "ScreenCaptureDetectionEnabled": "[turned on screenshot alerts]",
+    "ScreenCaptureDetectionDisabled": "[turned off screenshot alerts]",
+    "ScreenCaptureBlockingEnabled": "[turned on screenshot blocking]",
+    "ScreenCaptureBlockingDisabled": "[turned off screenshot blocking]",
+}
+
+
+def _notice(event: dict[str, Any]) -> str | None:
+    """One-line description of a system event (group, settings, deletes, key changes), or None."""
+    kind = event.get("type")
+    if kind == "GroupChange":
+        return _group_notice(event.get("change") or {})
+    if kind == "SettingsChange":
+        change = event.get("change") or {}
+        if change.get("setting") == "MessageDuration" and isinstance(change.get("ttl_msec"), int):
+            return f"[set disappearing messages to {_duration(change['ttl_msec'] // 1000)}]"
+        return _SETTING_NOTICES.get(change.get("setting"), "[changed a conversation setting]")
+    if kind == "MessageDeleted":
+        count = len(event.get("message_ids") or [])
+        scope = " for everyone" if event.get("delete_for_all") else ""
+        return f"[deleted {count} message{'s' if count != 1 else ''}{scope}]"
+    if kind == "ConversationDeleted":
+        return "[deleted the conversation]"
+    if kind == "MemberDeleted":
+        return f"[the account of {event.get('member_id')} was deleted]"
+    if kind == "KeyChange":
+        return "[conversation key changed]"
+    if kind == "Failure":
+        return f"[message failed: {event.get('failure')}]"
+    return None
+
+
 def _readable_event(
     event: dict[str, Any], info: dict[str, Any], keys: dict[str, Any]
 ) -> tuple[dict[str, Any], str]:
@@ -852,6 +1029,8 @@ def _readable_event(
     if event.get("type") == "Unknown":
         fields, text = _fallback_event(info)
         return {**event, **fields}, text
+    if event.get("type") == "GroupChange":
+        return {**event, "change": _group_change(event, info, keys)}, ""
     return event, ""
 
 
@@ -927,6 +1106,11 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     unverified_senders: set[str] = set()
     for i, event_b64 in enumerate(events):
+        if i not in decoded and infos[i]:
+            fallback = _message_key_event(infos[i], keys or {})
+            if fallback is not None:
+                decoded[i] = fallback
+                errors.pop(str(i), None)
         if i not in decoded:
             messages.append(_placeholder(event_b64, infos[i] or {}, errors.get(str(i), "")))
             continue
@@ -935,14 +1119,11 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
         sender = str(event.get("sender_id") or "")
         if status == "unverified" and sender:
             unverified_senders.add(sender)
-        messages.append(
-            {
-                "event": event,
-                "text": text,
-                "original_b64": event_b64,
-                "status": status,
-            }
-        )
+        row = {"event": event, "text": text, "original_b64": event_b64, "status": status}
+        notice = _notice(event)
+        if notice:
+            row["notice"] = notice
+        messages.append(row)
     texts = {
         m["event"].get("sequence_id"): m["text"] for m in messages if m["event"].get("type") == "Message"
     }
