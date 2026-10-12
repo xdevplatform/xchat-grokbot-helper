@@ -797,6 +797,60 @@ class RichTextEntityTest(unittest.TestCase):
         self.assertEqual(sent_entities(fields), [(0, 5, 3), (6, 10, 1), (11, 13, 2), (14, 20, 5), (21, 34, 4)])
 
 
+def session_encrypt(**options) -> dict:
+    """session-encrypt on the vector thread as user 2222, with these extra stdin options."""
+    body = {"conversation_id": "1111:2222", **encrypted_thread([SDK_KEY]), **options}
+    return run_cli("--juicebox", "{}", "session-encrypt", pin=PIN, stdin=body)
+
+
+def sent_create(fields: dict) -> tuple[dict, tuple[int, dict]]:
+    """An encrypt payload's message create event and its opened (entry variant, fields)."""
+    key = base64.b64decode(VECTORS["conversation_key"])
+    event, _ = xchat_lite._thrift_value(base64.b64decode(fields["encoded_message_create_event"]), 0, STRUCT)
+    holder, _ = xchat_lite._thrift_value(xchat_lite._open_box(key, event[100]), 0, STRUCT)
+    return event, next(iter(holder[1].items()))
+
+
+class SessionEncryptActionTest(unittest.TestCase):
+    def test_plain_message_is_marked_as_a_message(self):
+        fields = session_encrypt(text="hello", ttl_msec=60000)
+        event, (variant, contents) = sent_create(fields)
+        self.assertEqual((fields["action"], variant, contents[1], event[103]), ("message", 1, b"hello", 60000))
+
+    def test_reply_carries_a_preview_of_the_target(self):
+        fields = session_encrypt(text="pong", reply_to="1")
+        _, (variant, contents) = sent_create(fields)
+        self.assertEqual((fields["action"], fields["target_sequence_id"], variant), ("reply", "1", 1))
+        self.assertEqual(contents[4][2], MESSAGE_TEXT.encode())
+        self.assertEqual(contents[4][6], b"1")
+
+    def test_reply_target_can_be_its_message_id(self):
+        fields = session_encrypt(text="pong", reply_to="2c2a1d32-988b-4b0e-9e63-c3baab3003fd")
+        self.assertEqual(fields["target_sequence_id"], "1")
+
+    def test_reaction_add_and_remove(self):
+        added = session_encrypt(reaction={"target": "1", "emoji": "👍"})
+        removed = session_encrypt(reaction={"target": "1", "emoji": "👍", "remove": True})
+        self.assertEqual((added["action"], removed["action"]), ("reaction", "reaction_removed"))
+        self.assertEqual(sent_create(added)[1], (2, {1: b"1", 2: "👍".encode()}))
+        self.assertEqual(sent_create(removed)[1][0], 3)
+
+    def test_edit_replaces_the_text_with_entities(self):
+        fields = session_encrypt(text="see @xdev", edit="1")
+        _, (variant, edit) = sent_create(fields)
+        self.assertEqual((fields["action"], variant, edit[1], edit[2]), ("edit", 4, b"1", b"see @xdev"))
+        self.assertEqual([(e[1], e[2]) for e in edit[3]], [(4, 9)])
+
+    def test_unknown_target_or_conflicting_options_fail(self):
+        for options in (
+            {"text": "x", "reply_to": "999"},
+            {"text": "x", "reply_to": "1", "edit": "1"},
+            {"reaction": {"target": "1", "emoji": "👍"}, "ttl_msec": 1},
+        ):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                session_encrypt(**options)
+
+
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()
