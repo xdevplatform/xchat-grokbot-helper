@@ -25,6 +25,13 @@ CLI:
                           #         verified | unencrypted | unverified (placeholder text and
                           #         an error when an event can't be decoded),
                           #         unverified_senders, skipped_signing_keys, errors
+  decrypt-media           # stdin: decrypt's input (the media's message event, conversation_key_events,
+                          #        signing_keys) plus "media": [{"media_hash_key": "...", "input": PATH}]
+                          # input: a saved chat_media_download result, or the raw downloaded bytes
+                          # --out-dir: where decrypted files go (default
+                          #            ~/.cache/xchat-grokbot-helper/media, mode 700)
+                          # stdout: media[] with each decrypted file's path (mode 600), mime_type and
+                          #         size_bytes, and errors keyed by media index
   prepare-keys            # stdin: {"public_keys":[...], "conversation_id"?}
                           # public_keys entries: user_id, public_key (identity), key_version
                           # stdout: add_conversation_keys body fields (+ optional _local_conversation_key)
@@ -62,7 +69,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from chat_xdk import Chat
+from chat_xdk import Chat, detect_mime_type
 
 
 def _as_dict(obj: Any) -> dict[str, Any]:
@@ -1122,6 +1129,164 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     }
 
 
+_MEDIA_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "video/mp4": ".mp4",
+}
+
+
+def _media_from_result(doc: Any) -> bytes:
+    """Downloaded bytes from a chat_media_download result.
+
+    Takes the tool's text ({"encoding": "base64", "data": ...}) or the MCP tool
+    result or JSON-RPC response around it. A failed download raises with the
+    tool's error.
+    """
+    if isinstance(doc, dict) and isinstance(doc.get("result"), dict):
+        return _media_from_result(doc["result"])
+    if isinstance(doc, dict) and isinstance(doc.get("error"), dict):
+        raise ValueError(f"download failed: {doc['error'].get('message')}")
+    if isinstance(doc, dict) and isinstance(doc.get("content"), list):
+        texts = [i.get("text") for i in doc["content"] if isinstance(i, dict) and i.get("type") == "text"]
+        if texts and isinstance(texts[0], str):
+            try:
+                inner = json.loads(texts[0])
+            except ValueError:
+                if doc.get("isError"):
+                    raise ValueError(f"download failed: {texts[0][:200]}") from None
+                raise ValueError("not a chat_media_download result") from None
+            return _media_from_result(inner)
+    if isinstance(doc, dict) and doc.get("encoding") == "base64" and isinstance(doc.get("data"), str):
+        data = base64.b64decode(doc["data"], validate=True)
+        if doc.get("size_bytes") not in (None, len(data)):
+            raise ValueError(f"download holds {len(data)} bytes, not {doc['size_bytes']}")
+        return data
+    if isinstance(doc, dict) and (doc.get("detail") or doc.get("title")):
+        raise ValueError(f"download failed: {doc.get('detail') or doc.get('title')}")
+    raise ValueError("not a chat_media_download result")
+
+
+def _downloaded_media(path: str) -> bytes:
+    """Bytes from a file holding a chat_media_download result, or the raw bytes themselves."""
+    raw = Path(path).read_bytes()
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return raw
+    return _media_from_result(doc)
+
+
+def _media_message(
+    messages: list[dict[str, Any]], media_hash_key: str
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """The decrypted event that references this media, with its media attachment ({} for a link image)."""
+    for message in messages:
+        event = message.get("event") or {}
+        attachment = next(
+            (
+                a
+                for a in event.get("attachments") or []
+                if isinstance(a, dict) and a.get("media_hash_key") == media_hash_key
+            ),
+            None,
+        )
+        referenced = any(
+            isinstance(h, dict) and h.get("media_hash_key") == media_hash_key
+            for h in event.get("media_hashes") or []
+        )
+        if attachment is not None or referenced:
+            return event, attachment or {}
+    return None
+
+
+def _media_extension(attachment: dict[str, Any], plaintext: bytes) -> str:
+    """The attachment's filename extension, else one for the detected type, else .bin."""
+    suffix = Path(str(attachment.get("filename") or "")).suffix.lower()
+    if 1 < len(suffix) <= 6 and suffix[1:].isalnum():
+        return suffix
+    extension = _MEDIA_EXTENSIONS.get(detect_mime_type(plaintext) or "")
+    if extension:
+        return extension
+    return ".gif" if attachment.get("media_type") == "gif" else ".bin"
+
+
+def _media_dir(out_dir: str) -> Path:
+    """The --out-dir as given, or the default cache directory with mode 700."""
+    if out_dir:
+        path = Path(out_dir)
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path
+    cache = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    path = Path(cache) / _SAVED_KEY_SERVICE / "media"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    # mkstemp creates the file with mode 600.
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
+    """Decrypt each downloaded media with the conversation key of the message that references it.
+
+    Media of a message without a conversation key version is stored unencrypted
+    and is written as downloaded.
+    """
+    decrypted = _decrypt(chat, payload)
+    keys = decrypted["conversation_keys"]
+    if "keys" in keys:
+        keys = keys.get("keys") or {}
+    media: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    for i, request in enumerate(payload.get("media") or []):
+        media_hash_key = str(request.get("media_hash_key") or "")
+        try:
+            found = _media_message(decrypted["messages"], media_hash_key)
+            if found is None:
+                failed = len(decrypted["errors"])
+                hint = f" ({failed} event(s) could not be decrypted)" if failed else ""
+                raise ValueError(f"no decrypted message references this media_hash_key; include its event{hint}")
+            event, attachment = found
+            downloaded = _downloaded_media(str(request.get("input") or ""))
+            version = event.get("key_version")
+            if version is None:
+                plaintext = downloaded
+            elif version in keys:
+                plaintext = chat.decrypt_stream(downloaded, base64.b64decode(keys[version]))
+            else:
+                raise ValueError(f"no conversation key {version}; include meta.conversation_key_events")
+            name = "".join(c for c in media_hash_key if c.isalnum()) or f"media-{i}"
+            path = out_dir / f"{name}{_media_extension(attachment, plaintext)}"
+            _write_private(path, plaintext)
+        except (OSError, ValueError) as e:
+            errors[str(i)] = str(e)
+            continue
+        media.append(
+            {
+                "media_hash_key": media_hash_key,
+                "path": str(path),
+                "mime_type": detect_mime_type(plaintext),
+                "size_bytes": len(plaintext),
+                "media_type": attachment.get("media_type"),
+                "sequence_id": event.get("sequence_id"),
+                "sender_id": event.get("sender_id"),
+            }
+        )
+    return {"media": media, "errors": errors}
+
+
 def cmd_unlock_check(args: argparse.Namespace) -> None:
     chat, user_id, key_status = _open_session(args)
     print(
@@ -1144,6 +1309,12 @@ def cmd_forget(args: argparse.Namespace) -> None:
 def cmd_decrypt(args: argparse.Namespace) -> None:
     chat, _ = _session_from_env(args)
     print(json.dumps(_decrypt(chat, json.load(sys.stdin)), ensure_ascii=False))
+
+
+def cmd_decrypt_media(args: argparse.Namespace) -> None:
+    chat, _ = _session_from_env(args)
+    result = _decrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir))
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_encrypt(args: argparse.Namespace) -> None:
@@ -1268,6 +1439,11 @@ def main() -> None:
     sub.add_parser("unlock-check", help="Verify the saved key or PIN unlocks the keys")
     sub.add_parser("forget", help="Delete the key saved by --remember-key")
     sub.add_parser("decrypt", help="Decrypt event blobs from stdin JSON")
+    p_media = sub.add_parser(
+        "decrypt-media",
+        help="Decrypt saved chat_media_download results into files",
+    )
+    p_media.add_argument("--out-dir", default="")
     p_enc = sub.add_parser(
         "encrypt",
         help="Encrypt text for send_chat_message (keys must already be warm)",
@@ -1292,6 +1468,8 @@ def main() -> None:
         cmd_forget(args)
     elif args.cmd == "decrypt":
         cmd_decrypt(args)
+    elif args.cmd == "decrypt-media":
+        cmd_decrypt_media(args)
     elif args.cmd == "encrypt":
         cmd_encrypt(args)
     elif args.cmd == "prepare-keys":

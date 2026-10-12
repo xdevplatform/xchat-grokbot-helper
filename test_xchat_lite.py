@@ -985,5 +985,136 @@ class SavedKeyTest(unittest.TestCase):
             self.assertIsNone(real_keyring_lookup())
 
 
+PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + b"pixels"
+
+
+def encrypted_media_message(media_hash_key: str) -> str:
+    """An unsigned message encrypted under the vector conversation key, carrying one image."""
+    chat = chat_xdk.Chat()
+    chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
+    payload = chat.encrypt_message(
+        "1111:2222",
+        "look",
+        sender_id=SENDER_ID,
+        signing_key_version="1",
+        conversation_key=base64.b64decode(VECTORS["conversation_key"]),
+        conversation_key_version="1001",
+        attachments=[
+            {
+                "attachment_type": "media",
+                "media_hash_key": media_hash_key,
+                "width": 1,
+                "height": 1,
+                "filesize_bytes": 100,
+                "filename": "IMG_0001.PNG",
+                "media_type": 1,
+            }
+        ],
+    )
+    return _message_event(base64.b64decode(payload.encrypted_content), SENDER_ID, "1111:2222")
+
+
+def tool_text(blob: bytes, **overrides) -> dict:
+    """The chat_media_download tool's text for these downloaded bytes."""
+    text = {
+        "content_type": "application/octet-stream",
+        "size_bytes": len(blob),
+        "encoding": "base64",
+        "data": base64.b64encode(blob).decode(),
+    }
+    text.update(overrides)
+    return text
+
+
+def tool_result(text) -> dict:
+    """An MCP tools/call result whose text item is `text` (a dict is serialized)."""
+    return {"content": [{"type": "text", "text": text if isinstance(text, str) else json.dumps(text)}]}
+
+
+class DecryptMediaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.key = base64.b64decode(VECTORS["conversation_key"])
+
+    def saved(self, name: str, content) -> str:
+        """Path of a file holding `content`: bytes as is, anything else as JSON."""
+        path = self.tmp / name
+        path.write_bytes(content if isinstance(content, bytes) else json.dumps(content).encode())
+        return str(path)
+
+    def run_media(self, events: list[str], media: list[dict], *argv: str) -> dict:
+        stdin = {"conversation_key_events": [VECTORS["key_change_event"]], "events": events, "media": media}
+        return run_cli("--juicebox", "{}", "decrypt-media", *argv, pin=PIN, stdin=stdin)
+
+    def test_decrypts_a_downloaded_image_with_its_message_key(self):
+        blob = chat_xdk.Chat().encrypt_stream(PNG, self.key)
+        saved_results = {
+            "the tool text a harness saved": tool_text(blob),
+            "a whole JSON-RPC response": {"jsonrpc": "2.0", "id": 1, "result": tool_result(tool_text(blob))},
+        }
+        for shape, content in saved_results.items():
+            with self.subTest(shape):
+                out_dir = self.tmp / shape.replace(" ", "-")
+                result = self.run_media(
+                    [encrypted_media_message("AGgkIbPRTG")],
+                    [{"media_hash_key": "AGgkIbPRTG", "input": self.saved("result.json", content)}],
+                    "--out-dir",
+                    str(out_dir),
+                )
+                self.assertEqual(result["errors"], {})
+                [media] = result["media"]
+                path = Path(media["path"])
+                self.assertEqual(path, out_dir / "AGgkIbPRTG.png")
+                self.assertEqual(path.read_bytes(), PNG)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(
+                    {k: media[k] for k in ("mime_type", "size_bytes", "media_type", "sender_id")},
+                    {"mime_type": "image/png", "size_bytes": len(PNG), "media_type": "image", "sender_id": SENDER_ID},
+                )
+
+    def test_each_media_that_cannot_be_decrypted_gets_an_error(self):
+        blob = chat_xdk.Chat().encrypt_stream(PNG, self.key)
+        forbidden = {"title": "Forbidden", "detail": "Missing required OAuth2 scopes: media.write"}
+        too_large = {**tool_result("Failed to read response body: length limit exceeded"), "isError": True}
+        media = [
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("403.json", tool_result(forbidden))},
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("too-large.json", too_large)},
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("lossy.json", tool_result("\ufffdPNG\ufffd"))},
+            {
+                "media_hash_key": "AGgkIbPRTG",
+                "input": self.saved("wrong-key.json", tool_text(chat_xdk.Chat().encrypt_stream(PNG, os.urandom(32)))),
+            },
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("short.json", tool_text(blob, size_bytes=len(blob) + 1))},
+            {"media_hash_key": "Unknown1", "input": self.saved("other.json", tool_text(blob))},
+        ]
+        result = self.run_media([encrypted_media_message("AGgkIbPRTG")], media, "--out-dir", str(self.tmp))
+        self.assertEqual(result["media"], [])
+        self.assertEqual(
+            result["errors"],
+            {
+                "0": "download failed: Missing required OAuth2 scopes: media.write",
+                "1": "download failed: Failed to read response body: length limit exceeded",
+                "2": "not a chat_media_download result",
+                "3": result["errors"]["3"],
+                "4": f"download holds {len(blob)} bytes, not {len(blob) + 1}",
+                "5": "no decrypted message references this media_hash_key; include its event",
+            },
+        )
+        self.assertIn("Decryption failed", result["errors"]["3"])
+        self.assertEqual(list(self.tmp.glob("AGgkIbPRTG*")), [])
+
+    def test_media_of_an_unencrypted_message_is_written_as_downloaded(self):
+        event = plain_entry_event(1, _text(1, "look"), _list(3, media(1)))
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.tmp)}):
+            result = self.run_media([event], [{"media_hash_key": "hash-key", "input": self.saved("raw.bin", PNG)}])
+        self.assertEqual(result["errors"], {})
+        media_dir = self.tmp / "xchat-grokbot-helper" / "media"
+        self.assertEqual(Path(result["media"][0]["path"]), media_dir / "hashkey.png")
+        self.assertEqual((media_dir / "hashkey.png").read_bytes(), PNG)
+        self.assertEqual(stat.S_IMODE(media_dir.stat().st_mode), 0o700)
+
+
 if __name__ == "__main__":
     unittest.main()
