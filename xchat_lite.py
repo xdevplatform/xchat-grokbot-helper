@@ -29,6 +29,8 @@ CLI:
                           # public_keys entries: user_id, public_key (identity), key_version
                           # stdout: add_conversation_keys body fields (+ optional _local_conversation_key)
   encrypt CONV_ID TEXT    # needs conversation key in cache OR pass --from-decrypt/--from-prepare
+                          # encrypt and session-encrypt mark URLs, emails, @mentions, #hashtags and
+                          # $cashtags as rich-text entities
   session-encrypt         # stdin JSON: warm keys then encrypt in ONE process
                           # {
                           #   "conversation_id": "...",
@@ -36,7 +38,12 @@ CLI:
                           #   "events": [...],              # optional: decrypt to warm cache
                           #   "signing_keys": [...],        # with events
                           #   "prepare": {"public_keys":[...], "conversation_id"?}  # optional first-contact
+                          #   "reply_to": "SEQ_OR_MESSAGE_ID",   # optional: reply to a message in events
+                          #   "edit": "SEQ_OR_MESSAGE_ID",       # optional: text replaces that message's text
+                          #   "reaction": {"target": "SEQ_OR_MESSAGE_ID", "emoji": "👍", "remove"?: true},
+                          #   "attachments": [...], "ttl_msec": N, "should_notify": false  # optional, chat-xdk shapes
                           # }
+                          # stdout adds "action": message | reply | reaction | reaction_removed | edit
 """
 
 from __future__ import annotations
@@ -47,9 +54,11 @@ import binascii
 import hmac
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -308,13 +317,166 @@ def _prep_to_add_keys(prep: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_URL = re.compile(r"https?://[^\s<>\"'`]+")
+_URL_TRAILING = ".,;:!?'\")]}*_"
+
+
+def _url_entities(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, "url") for each http(s) URL, in UTF-16 code units, as the X apps mark links.
+
+    Trailing punctuation isn't part of the link; a closing parenthesis is when it balances one
+    in the URL.
+    """
+    spans = []
+    for match in _URL.finditer(text):
+        url = match.group(0)
+        while url and url[-1] in _URL_TRAILING:
+            if url[-1] == ")" and url.count("(") >= url.count(")"):
+                break
+            url = url[:-1]
+        if len(url) <= len("https://"):
+            continue
+        start = len(text[: match.start()].encode("utf-16-le")) // 2
+        spans.append((start, start + len(url.encode("utf-16-le")) // 2, "url"))
+    return spans
+
+
+# Mentions, hashtags and cashtags as twitter-text finds them, and emails with x-android's regex.
+_EMAIL = re.compile(r"[a-zA-Z0-9+._%-]{1,256}@[a-zA-Z0-9][a-zA-Z0-9-]{0,64}(\.[a-zA-Z0-9][a-zA-Z0-9-]{1,63})+")
+# twitter-text's LATIN_ACCENTS: a mention that runs into one isn't a mention.
+_LATIN_ACCENTS = (
+    r"\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\u0100-\u024f\u0253\u0254\u0256\u0257\u0259\u025b\u0263"
+    r"\u0268\u026f\u0272\u0289\u028b\u02bb\u0300-\u036f\u1e00-\u1eff"
+)
+_MENTION = re.compile(
+    r"(?:(?<![A-Za-z0-9_!@＠#$%&*])|(?<=(?<![A-Za-z0-9_+~.-])[Rr][Tt]))"
+    r"[@＠][A-Za-z0-9_]{1,20}(?![A-Za-z0-9_@＠" + _LATIN_ACCENTS + r"]|://)"
+)
+# twitter-text's other hashtag characters: underscore, ZWNJ, ZWJ and some in-word punctuation.
+_HASHTAG_EXTRAS = "_\u200c\u200d\ua67e\u05be\u05f3\u05f4\uff5e\u301c\u309b\u309c\u30a0\u30fb\u3003\u0f0b\u0f0c\u00b7"
+_CASHTAG = re.compile(r"(?:^|(?<=\s))\$[A-Za-z]{1,6}(?:[._][A-Za-z]{1,2})?(?=$|\s|[!-/:-@\[-`{-~])")
+
+
+def _hashtag_pattern(text: str) -> re.Pattern[str]:
+    """twitter-text's hashtag regex, with classes built from this text's characters.
+
+    re has no \\p{L}, \\p{M} or \\p{Nd}, and classifying all of Unicode with unicodedata takes
+    about 0.25s, so the classes hold ASCII plus the text's letters, Mn/Mc marks and digits.
+    """
+    letters, digits = "A-Za-z", "0-9"
+    for ch in sorted(set(text)):
+        if ch > "\x7f":
+            category = unicodedata.category(ch)
+            if category[0] == "L" or category in ("Mn", "Mc"):
+                letters += ch
+            elif category == "Nd":
+                digits += ch
+    chars = letters + digits + _HASHTAG_EXTRAS
+    # Hashtag characters in the end check keep the regex from backtracking to a shorter tag.
+    return re.compile(
+        rf"(?:(?<=[\ufe0e\ufe0f])|(?<![&{chars}]))[#＃](?![\ufe0f\u20e3])"
+        rf"[{chars}]*[{letters}][{chars}]*(?![#＃{chars}]|://)"
+    )
+
+
+def _utf16_offset(text: str, index: int) -> int:
+    return len(text[:index].encode("utf-16-le")) // 2
+
+
+def _text_entities(text: str) -> list[tuple[int, int, str]]:
+    """URL, email, mention, hashtag and cashtag entities, in UTF-16 code units, as the X apps send them.
+
+    URLs win over anything inside them; otherwise the earlier kind in the list wins an overlap.
+    """
+    spans = list(_url_entities(text))
+    patterns = (("email", _EMAIL), ("mention", _MENTION), ("hashtag", _hashtag_pattern(text)), ("cashtag", _CASHTAG))
+    for kind, pattern in patterns:
+        for match in pattern.finditer(text):
+            start, end = _utf16_offset(text, match.start()), _utf16_offset(text, match.end())
+            if all(end <= s or start >= e for s, e, _ in spans):
+                spans.append((start, end, kind))
+    return sorted(spans)
+
+
 def _encrypt_payload(chat: Chat, conversation_id: str, text: str, **kwargs: Any) -> dict[str, str]:
-    payload = chat.encrypt_message(conversation_id, text, **kwargs)
+    # Without entities X Chat shows links, mentions and tags as plain text.
+    if "entities" not in kwargs:
+        kwargs["entities"] = _text_entities(text) or None
+    return _send_fields(chat.encrypt_message(conversation_id, text, **kwargs))
+
+
+def _send_fields(payload: Any) -> dict[str, str]:
     return {
         "message_id": payload.message_id,
         "encoded_message_create_event": payload.encrypted_content,
         "encoded_message_event_signature": payload.encoded_event_signature,
     }
+
+
+# session-encrypt options passed straight to encrypt_message / encrypt_reply.
+_MESSAGE_OPTIONS = ("attachments", "ttl_msec", "should_notify")
+
+
+def _target_message(decrypted: dict[str, Any] | None, target: str) -> dict[str, Any]:
+    """The decrypted row of the message with this sequence id or message id."""
+    for message in (decrypted or {}).get("messages") or []:
+        event = message.get("event") or {}
+        if event.get("type") == "Message" and target in (event.get("sequence_id"), event.get("id")):
+            if "error" not in message:
+                return message
+    raise SystemExit(f"message {target} isn't among the decrypted events; include its event to reply, react or edit")
+
+
+def _reply_key_events(body: dict[str, Any], decrypted: dict[str, Any], target: dict[str, Any]) -> list[str]:
+    """Key change events for the target's key version, when the conversation has rotated keys."""
+    keys = (decrypted.get("conversation_keys") or {}).get("keys") or {}
+    version = target["event"].get("key_version")
+    if not version or len(keys) < 2:
+        return []
+    events = [_event_b64(item) for item in body.get("conversation_key_events") or []]
+    return [e for e in events if e and (_event_info(e) or {}).get("key_version") == version]
+
+
+def _encrypt_action(
+    chat: Chat, body: dict[str, Any], conversation_id: str, decrypted: dict[str, Any] | None, enc_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Send fields for session-encrypt's message, reply, reaction or edit, with "action" added."""
+    text = body.get("text")
+    reaction = body.get("reaction")
+    reply_to, edit = _scalar(body.get("reply_to")), _scalar(body.get("edit"))
+    if sum(1 for option in (reaction, reply_to, edit) if option) > 1:
+        raise SystemExit("pass only one of reply_to, reaction and edit")
+    options = {name: body[name] for name in _MESSAGE_OPTIONS if body.get(name) is not None}
+    if options and (reaction or edit):
+        raise SystemExit(f"{', '.join(options)} only apply to a message or a reply")
+    if isinstance(reaction, dict):
+        target = _target_message(decrypted, _scalar(reaction.get("target")))
+        emoji = _scalar(reaction.get("emoji"))
+        if not emoji:
+            raise SystemExit("reaction needs target and emoji")
+        remove = reaction.get("remove") is True
+        encrypt = chat.encrypt_remove_reaction if remove else chat.encrypt_add_reaction
+        fields = _send_fields(encrypt(target["original_b64"], emoji, **enc_kwargs))
+        return {**fields, "action": "reaction_removed" if remove else "reaction",
+                "target_sequence_id": target["event"].get("sequence_id")}
+    if reaction is not None:
+        raise SystemExit("reaction must be an object with target and emoji")
+    if not isinstance(text, str):
+        raise SystemExit("stdin needs conversation_id and text")
+    entities = _text_entities(text) or None
+    if edit:
+        target = _target_message(decrypted, edit)
+        fields = _send_fields(chat.encrypt_edit(target["original_b64"], text, entities=entities, **enc_kwargs))
+        return {**fields, "action": "edit", "target_sequence_id": target["event"].get("sequence_id")}
+    if reply_to:
+        target = _target_message(decrypted, reply_to)
+        ckces = _reply_key_events(body, decrypted or {}, target)
+        payload = chat.encrypt_reply(
+            conversation_id, text, target["original_b64"],
+            reply_to_ckces=ckces or None, entities=entities, **options, **enc_kwargs,
+        )
+        return {**_send_fields(payload), "action": "reply", "target_sequence_id": target["event"].get("sequence_id")}
+    return {**_encrypt_payload(chat, conversation_id, text, **options, **enc_kwargs), "action": "message"}
 
 
 def _scalar(value: Any) -> str:
@@ -1023,7 +1185,7 @@ def cmd_session_encrypt(args: argparse.Namespace) -> None:
     body = json.load(sys.stdin)
     conversation_id = body.get("conversation_id") or body.get("id")
     text = body.get("text")
-    if not conversation_id or text is None:
+    if not conversation_id or (text is None and not body.get("reaction")):
         raise SystemExit("stdin needs conversation_id and text")
 
     # Optional: first-contact / empty thread key init (local only until MCP add_conversation_keys)
@@ -1050,6 +1212,7 @@ def cmd_session_encrypt(args: argparse.Namespace) -> None:
 
     # Optional: decrypt to warm set_cache_keys for existing threads
     decrypt_summary = None
+    result = None
     if body.get("events") or body.get("encoded_events") or body.get("conversation_key_events"):
         result = _decrypt(chat, body)
         decrypt_summary = {
@@ -1059,7 +1222,9 @@ def cmd_session_encrypt(args: argparse.Namespace) -> None:
         }
 
     try:
-        send_fields = _encrypt_payload(chat, conversation_id, text, **enc_kwargs)
+        send_fields = _encrypt_action(chat, body, conversation_id, result, enc_kwargs)
+    except SystemExit:
+        raise
     except Exception as e:
         raise SystemExit(
             f"session-encrypt failed: {e}. For empty threads, or threads with only "

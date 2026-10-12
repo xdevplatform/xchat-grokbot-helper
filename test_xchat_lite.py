@@ -743,6 +743,158 @@ class OpenBoxTest(unittest.TestCase):
         self.assertIsNone(xchat_lite._open_box(key, bytes(box)))
 
 
+def sent_entities(fields: dict) -> list[tuple[int, int, int]]:
+    """(start, end, content variant) for each entity in an encrypt payload's message contents."""
+    key = base64.b64decode(VECTORS["conversation_key"])
+    event, _ = xchat_lite._thrift_value(base64.b64decode(fields["encoded_message_create_event"]), 0, STRUCT)
+    contents, _ = xchat_lite._thrift_value(xchat_lite._open_box(key, event[100]), 0, STRUCT)
+    contents = contents[1][1]
+    return [(e[1], e[2], next(iter(e[3]))) for e in contents.get(2, [])]
+
+
+def encrypt(text: str) -> dict:
+    chat = chat_xdk.Chat()
+    chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
+    chat.set_identity("1111", "1")
+    key = base64.b64decode(VECTORS["conversation_key"])
+    return xchat_lite._encrypt_payload(chat, "1111-2222", text, conversation_key=key, conversation_key_version="1001")
+
+
+class UrlEntityTest(unittest.TestCase):
+    def test_urls_are_found_in_utf16_units(self):
+        self.assertEqual(xchat_lite._url_entities("see https://x.com/a."), [(4, 19, "url")])
+        self.assertEqual(xchat_lite._url_entities("𝕏 https://x.com"), [(3, 16, "url")])
+        self.assertEqual(xchat_lite._url_entities("[docs](https://docs.x.com)"), [(7, 25, "url")])
+        self.assertEqual(xchat_lite._url_entities("(https://en.wikipedia.org/wiki/A_(b))"), [(1, 36, "url")])
+        self.assertEqual(xchat_lite._url_entities("no links, just https:// and x.com"), [])
+
+    def test_encrypt_marks_urls_as_link_entities(self):
+        text = "Ship it: https://github.com/x/y/pull/1 and 𝕏 https://docs.x.com"
+        fields = encrypt(text)
+        # 4 is RichTextContent.url.
+        self.assertEqual(sent_entities(fields), [(9, 38, 4), (46, 64, 4)])
+
+    def test_text_without_urls_has_no_entities(self):
+        fields = encrypt("hello")
+        self.assertEqual(sent_entities(fields), [])
+
+
+def marked(text: str, kind: str) -> list[str]:
+    """Each `kind` entity _text_entities finds, without its @ or #, as twitter-text's conformance lists them."""
+    units = text.encode("utf-16-le")
+    return [units[2 * s + 2 : 2 * e].decode("utf-16-le") for s, e, k in xchat_lite._text_entities(text) if k == kind]
+
+
+class RichTextEntityTest(unittest.TestCase):
+    def test_mentions_tags_and_emails_are_found(self):
+        text = "hi @santi_m #XChat $TSLA, a.b@x.ai 𝕏 @ab"
+        self.assertEqual(
+            xchat_lite._text_entities(text),
+            [(3, 11, "mention"), (12, 18, "hashtag"), (19, 24, "cashtag"), (26, 34, "email"), (38, 41, "mention")],
+        )
+
+    def test_urls_win_and_lookalikes_are_skipped(self):
+        self.assertEqual(xchat_lite._text_entities("https://x.com/#a?u=@me"), [(0, 22, "url")])
+        self.assertEqual(xchat_lite._text_entities("C# #123 a@b price $5 &#39;"), [])
+
+    def test_hashtags_are_skipped_not_shortened(self):
+        # twitter-text's end rule: a tag that runs into # or :// isn't a hashtag.
+        for text in ("#love#instagood", "#tag://x", "#ab＃cd"):
+            with self.subTest(text=text):
+                self.assertEqual(xchat_lite._text_entities(text), [])
+
+    def test_twitter_text_conformance_cases(self):
+        # From twitter-text's conformance/extract.yml.
+        mentions = {
+            "RT@username RT:@mention RT @test": ["username", "mention", "test"],
+            "rt@username rt:@mention rt @test": ["username", "mention", "test"],
+            "@aliceìnheiro something something": [],
+        }
+        hashtags = {
+            "#http://twitter.com #https://twitter.com": [],
+            "a \u270c\ufe0f#hashtag here": ["hashtag"],
+            "#महात्मा #महात्मा_१२३४ #१२३४ गांधी": ["महात्मा", "महात्मा_१२३४"],
+            "#বাংলা #ગુજરાતી #ಕನ್ನಡ #മലയാളം #ଓଡ଼ିଆ #ਪੰਜਾਬੀ #සිංහල #தமிழ் #తెలుగు": [
+                "বাংলা", "ગુજરાતી", "ಕನ್ನಡ", "മലയാളം", "ଓଡ଼ିଆ", "ਪੰਜਾਬੀ", "සිංහල", "தமிழ்", "తెలుగు",
+            ],
+            "#ผู้เริ่ม #การเมือง #รายละเอียด #นักท่องเที่ยว #ของขวัญ #สนามบิน #เดินทาง #ประธาน": [
+                "ผู้เริ่ม", "การเมือง", "รายละเอียด", "นักท่องเที่ยว", "ของขวัญ", "สนามบิน", "เดินทาง", "ประธาน",
+            ],
+            "#བོད་སྐད་ #བོད་སྐད": ["བོད་སྐད་", "བོད་སྐད"],
+            "#មហាត្មះគន្ធី #မြင့်မြတ်သော #ຊີວະສາດ": ["មហាត្មះគន្ធី", "မြင့်မြတ်သော", "ຊີວະສາດ"],
+            "#עַל־יְדֵי #וכו׳ #מ״כ": ["עַל־יְדֵי", "וכו׳", "מ״כ"],
+            "#أي\u200cبي\u200cإم #می\u200cخواهم": ["أي\u200cبي\u200cإم", "می\u200cخواهم"],
+            "#ශ්\u200dරීලංකා": ["ශ්\u200dරීලංකා"],
+            "#𖼄𖽑": ["𖼄𖽑"],
+            "#il·lusió": ["il·lusió"],
+            "#メ～テレ ハッシュタグ内で～が認識されず": ["メ～テレ"],
+            "#云々 #学問のすゝめ #いすゞ #各〻 #各〃": ["云々", "学問のすゝめ", "いすゞ", "各〻", "各〃"],
+        }
+        for kind, cases in (("mention", mentions), ("hashtag", hashtags)):
+            for text, expected in cases.items():
+                with self.subTest(text=text):
+                    self.assertEqual(marked(text, kind), expected)
+
+    def test_encrypt_marks_each_entity_kind(self):
+        fields = encrypt("@xdev #api $X a@b.co https://x.com")
+        # RichTextContent variants: 1 hashtag, 2 cashtag, 3 mention, 4 url, 5 email.
+        self.assertEqual(sent_entities(fields), [(0, 5, 3), (6, 10, 1), (11, 13, 2), (14, 20, 5), (21, 34, 4)])
+
+
+def session_encrypt(**options) -> dict:
+    """session-encrypt on the vector thread as user 2222, with these extra stdin options."""
+    body = {"conversation_id": "1111:2222", **encrypted_thread([SDK_KEY]), **options}
+    return run_cli("--juicebox", "{}", "session-encrypt", pin=PIN, stdin=body)
+
+
+def sent_create(fields: dict) -> tuple[dict, tuple[int, dict]]:
+    """An encrypt payload's message create event and its opened (entry variant, fields)."""
+    key = base64.b64decode(VECTORS["conversation_key"])
+    event, _ = xchat_lite._thrift_value(base64.b64decode(fields["encoded_message_create_event"]), 0, STRUCT)
+    holder, _ = xchat_lite._thrift_value(xchat_lite._open_box(key, event[100]), 0, STRUCT)
+    return event, next(iter(holder[1].items()))
+
+
+class SessionEncryptActionTest(unittest.TestCase):
+    def test_plain_message_is_marked_as_a_message(self):
+        fields = session_encrypt(text="hello", ttl_msec=60000)
+        event, (variant, contents) = sent_create(fields)
+        self.assertEqual((fields["action"], variant, contents[1], event[103]), ("message", 1, b"hello", 60000))
+
+    def test_reply_carries_a_preview_of_the_target(self):
+        fields = session_encrypt(text="pong", reply_to="1")
+        _, (variant, contents) = sent_create(fields)
+        self.assertEqual((fields["action"], fields["target_sequence_id"], variant), ("reply", "1", 1))
+        self.assertEqual(contents[4][2], MESSAGE_TEXT.encode())
+        self.assertEqual(contents[4][6], b"1")
+
+    def test_reply_target_can_be_its_message_id(self):
+        fields = session_encrypt(text="pong", reply_to="2c2a1d32-988b-4b0e-9e63-c3baab3003fd")
+        self.assertEqual(fields["target_sequence_id"], "1")
+
+    def test_reaction_add_and_remove(self):
+        added = session_encrypt(reaction={"target": "1", "emoji": "👍"})
+        removed = session_encrypt(reaction={"target": "1", "emoji": "👍", "remove": True})
+        self.assertEqual((added["action"], removed["action"]), ("reaction", "reaction_removed"))
+        self.assertEqual(sent_create(added)[1], (2, {1: b"1", 2: "👍".encode()}))
+        self.assertEqual(sent_create(removed)[1][0], 3)
+
+    def test_edit_replaces_the_text_with_entities(self):
+        fields = session_encrypt(text="see @xdev", edit="1")
+        _, (variant, edit) = sent_create(fields)
+        self.assertEqual((fields["action"], variant, edit[1], edit[2]), ("edit", 4, b"1", b"see @xdev"))
+        self.assertEqual([(e[1], e[2]) for e in edit[3]], [(4, 9)])
+
+    def test_unknown_target_or_conflicting_options_fail(self):
+        for options in (
+            {"text": "x", "reply_to": "999"},
+            {"text": "x", "reply_to": "1", "edit": "1"},
+            {"reaction": {"target": "1", "emoji": "👍"}, "ttl_msec": 1},
+        ):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                session_encrypt(**options)
+
+
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()

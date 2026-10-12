@@ -107,6 +107,11 @@ JSON
 - **Existing thread:** pass recent `events` + `conversation_key_events` + `signing_keys` so decrypt can warm the conversation key, then encrypt.
 - **Empty / first message:** set `prepare` (same shape as `prepare-keys` stdin). Output includes `add_conversation_keys` and `needs_add_conversation_keys_before_send: true`. Call API `add_conversation_keys` **before** `send_chat_message`. Strip any `_local_*` fields — never send those upstream.
 
+Both `encrypt` and `session-encrypt` mark every `http://` or `https://` URL, email address, `@mention`, `#hashtag` and `$cashtag` in the text as a rich-text entity, as the X apps do, so they render as links.
+
+- **Reply, react, edit:** add one of `"reply_to": ID`, `"reaction": {"target": ID, "emoji": "👍", "remove"?: true}` or `"edit": ID` (with `text` as the new text). `ID` is the sequence id or message id of a message in `events`, which the helper needs to build the reply preview or name the target. A reaction needs no `text`. Output adds `action` (`message`, `reply`, `reaction`, `reaction_removed` or `edit`) and `target_sequence_id`. Send it with `send_chat_message` like any message. Give a new message a few seconds to arrive before editing it.
+- **Message options:** `attachments` (chat-xdk descriptors), `ttl_msec` and `should_notify` pass through to chat-xdk for a message or a reply.
+
 Standalone `encrypt CONV_ID TEXT` only works if keys are already warm (or you pass `--conversation-key-b64` / `--conversation-key-version`). Prefer `session-encrypt`.
 
 ## Typical agent / app flow
