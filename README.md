@@ -107,7 +107,7 @@ JSON
 - **Existing thread:** pass recent `events` + `conversation_key_events` + `signing_keys` so decrypt can warm the conversation key, then encrypt.
 - **Empty / first message:** set `prepare` (same shape as `prepare-keys` stdin). Output includes `add_conversation_keys` and `needs_add_conversation_keys_before_send: true`. Call API `add_conversation_keys` **before** `send_chat_message`. Strip any `_local_*` fields — never send those upstream.
 
-Both `encrypt` and `session-encrypt` mark every `http://` or `https://` URL in the text as a link entity, as the X apps do, so it renders as a hyperlink.
+Both `encrypt` and `session-encrypt` mark every `http://` or `https://` URL, email address, `@mention`, `#hashtag` and `$cashtag` in the text as a rich-text entity, as the X apps do, so they render as links.
 
 Standalone `encrypt CONV_ID TEXT` only works if keys are already warm (or you pass `--conversation-key-b64` / `--conversation-key-version`). Prefer `session-encrypt`.
 

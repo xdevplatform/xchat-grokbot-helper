@@ -779,6 +779,24 @@ class UrlEntityTest(unittest.TestCase):
         self.assertEqual(sent_entities(fields), [])
 
 
+class RichTextEntityTest(unittest.TestCase):
+    def test_mentions_tags_and_emails_are_found(self):
+        text = "hi @santi_m #XChat $TSLA, a.b@x.ai 𝕏 @ab"
+        self.assertEqual(
+            xchat_lite._text_entities(text),
+            [(3, 11, "mention"), (12, 18, "hashtag"), (19, 24, "cashtag"), (26, 34, "email"), (38, 41, "mention")],
+        )
+
+    def test_urls_win_and_lookalikes_are_skipped(self):
+        self.assertEqual(xchat_lite._text_entities("https://x.com/#a?u=@me"), [(0, 22, "url")])
+        self.assertEqual(xchat_lite._text_entities("C# #123 a@b price $5 &#39;"), [])
+
+    def test_encrypt_marks_each_entity_kind(self):
+        fields = encrypt("@xdev #api $X a@b.co https://x.com")
+        # RichTextContent variants: 1 hashtag, 2 cashtag, 3 mention, 4 url, 5 email.
+        self.assertEqual(sent_entities(fields), [(0, 5, 3), (6, 10, 1), (11, 13, 2), (14, 20, 5), (21, 34, 4)])
+
+
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()

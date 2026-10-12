@@ -29,7 +29,8 @@ CLI:
                           # public_keys entries: user_id, public_key (identity), key_version
                           # stdout: add_conversation_keys body fields (+ optional _local_conversation_key)
   encrypt CONV_ID TEXT    # needs conversation key in cache OR pass --from-decrypt/--from-prepare
-                          # encrypt and session-encrypt mark http(s) URLs as link entities
+                          # encrypt and session-encrypt mark URLs, emails, @mentions, #hashtags and
+                          # $cashtags as rich-text entities
   session-encrypt         # stdin JSON: warm keys then encrypt in ONE process
                           # {
                           #   "conversation_id": "...",
@@ -334,10 +335,36 @@ def _url_entities(text: str) -> list[tuple[int, int, str]]:
     return spans
 
 
+# Mentions, hashtags and cashtags as twitter-text finds them, and emails with x-android's regex.
+_EMAIL = re.compile(r"[a-zA-Z0-9+._%-]{1,256}@[a-zA-Z0-9][a-zA-Z0-9-]{0,64}(\.[a-zA-Z0-9][a-zA-Z0-9-]{1,63})+")
+_MENTION = re.compile(r"(?<![A-Za-z0-9_!@＠#$%&*])[@＠][A-Za-z0-9_]{1,20}(?![A-Za-z0-9_@＠]|://)")
+_HASHTAG = re.compile(r"(?<![\w&])[#＃]\w*[^\W\d_]\w*(?![#＃]|://)")
+_CASHTAG = re.compile(r"(?:^|(?<=\s))\$[A-Za-z]{1,6}(?:[._][A-Za-z]{1,2})?(?=$|\s|[!-/:-@\[-`{-~])")
+_TEXT_ENTITY_PATTERNS = (("email", _EMAIL), ("mention", _MENTION), ("hashtag", _HASHTAG), ("cashtag", _CASHTAG))
+
+
+def _utf16_offset(text: str, index: int) -> int:
+    return len(text[:index].encode("utf-16-le")) // 2
+
+
+def _text_entities(text: str) -> list[tuple[int, int, str]]:
+    """URL, email, mention, hashtag and cashtag entities, in UTF-16 code units, as the X apps send them.
+
+    URLs win over anything inside them; otherwise the earlier kind in the list wins an overlap.
+    """
+    spans = list(_url_entities(text))
+    for kind, pattern in _TEXT_ENTITY_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = _utf16_offset(text, match.start()), _utf16_offset(text, match.end())
+            if all(end <= s or start >= e for s, e, _ in spans):
+                spans.append((start, end, kind))
+    return sorted(spans)
+
+
 def _encrypt_payload(chat: Chat, conversation_id: str, text: str, **kwargs: Any) -> dict[str, str]:
-    # Without entities X Chat shows URLs as plain text.
+    # Without entities X Chat shows links, mentions and tags as plain text.
     if "entities" not in kwargs:
-        kwargs["entities"] = _url_entities(text) or None
+        kwargs["entities"] = _text_entities(text) or None
     payload = chat.encrypt_message(conversation_id, text, **kwargs)
     return {
         "message_id": payload.message_id,
