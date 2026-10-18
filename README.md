@@ -157,7 +157,7 @@ Standalone `encrypt CONV_ID TEXT` only works if keys are already warm (or you pa
 
 An image is uploaded encrypted under the conversation key, then a message points at it by its `media_hash_key`:
 
-1. Fetch the thread's events (every page, with `meta.conversation_key_events`) and every sender's signing keys, as for a text reply.
+1. Fetch the thread's events only until you have its latest key change. Pages come newest first, and the first page usually has it, in `data` or in `meta.conversation_key_events`. Fetch the next page only when a page has neither. Get the signing keys of the senders on those pages, including the key change's sender, with `get_users_public_keys`.
 2. `encrypt-media` with those, the `conversation_id` and `"media": [{"input": "/path/to/photo.jpg"}]`. Each image must be a PNG, JPEG, GIF or WebP of at most 5 MiB. Each part holds at most 4 MiB of the encrypted image; `--part-bytes` makes parts smaller.
 3. `chat_media_upload_initialize` with `conversation_id` set to encrypt-media's `upload_conversation_id` (the colon form, `111:222`, which the upload tools take) and the image's `total_bytes`. Keep the `session_id`, `media_hash_key` and `conversation_id` it returns.
 4. `chat_media_upload_append` once per part: `id` is the `session_id`, `media` is the contents of the part's file, `segment_index` is the part's, plus the `conversation_id` and `media_hash_key` from step 3.

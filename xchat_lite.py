@@ -36,6 +36,7 @@ CLI:
                           #         size_bytes, and errors keyed by media index
   encrypt-media           # stdin: session-encrypt's conversation_id, events, conversation_key_events and
                           #        signing_keys, plus "media": [{"input": PATH, "filename"?}]
+                          # events: pages only up to the one holding the latest key change
                           # input: a PNG, JPEG, GIF or WebP image of at most 5 MiB
                           # --out-dir: where part files go (default ~/.cache/xchat-grokbot-helper/media)
                           # --part-bytes: encrypted bytes per part, 65536 to 4194304 (the default)
@@ -1580,9 +1581,10 @@ def _current_conversation_key(chat: Chat, conversation_id: str, decrypted: dict[
         version = chat.encrypt_message(conversation_id, "").conversation_key_version
     except Exception as e:
         raise SystemExit(
-            f"encrypt-media failed: {e}. Include the conversation's events, conversation_key_events and "
-            f"the senders' signing_keys, as for session-encrypt. A new conversation needs its first "
-            f"message (session-encrypt with prepare, then add_conversation_keys) before an image."
+            f"encrypt-media failed: {e}. Include the conversation's latest key change (page events "
+            f"until one page has it in data or meta.conversation_key_events) and its sender's "
+            f"signing_keys. A new conversation needs its first message (session-encrypt with "
+            f"prepare, then add_conversation_keys) before an image."
         ) from e
     keys = decrypted["conversation_keys"]
     if "keys" in keys:

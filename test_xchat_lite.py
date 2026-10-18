@@ -1338,6 +1338,19 @@ class EncryptMediaTest(unittest.TestCase):
             sorted(p.name for p in Path(result["upload_dir"]).iterdir()), ["image6-part0.b64", "image7-part0.b64"]
         )
 
+    def test_the_latest_key_change_alone_is_enough(self):
+        photo = self.saved("photo.png", png(1, 1))
+        for where in ("conversation_key_events", "events"):
+            with self.subTest(where=where):
+                stdin = {
+                    "conversation_id": "1111-2222",
+                    where: [VECTORS["key_change_event"]],
+                    "signing_keys": [SDK_KEY],
+                    "media": [{"input": photo}],
+                }
+                result = run_cli("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.out), pin=PIN, stdin=stdin)
+                self.assertEqual((result["errors"], result["media"][0]["conversation_key_version"]), ({}, "1001"))
+
     def test_needs_a_verified_conversation_key(self):
         with self.assertRaises(SystemExit) as raised:
             self.run_encrypt([{"input": self.saved("photo.png", png(1, 1))}], signing_keys=())
