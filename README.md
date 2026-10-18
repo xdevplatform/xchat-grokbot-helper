@@ -16,9 +16,11 @@ System events keep empty `text` and add a `notice`, such as `[added 333, 444]`, 
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -U pip chatxdk
+.venv/bin/pip install -U pip "chatxdk<0.6"
 # place xchat_lite.py in this directory (or anywhere on PATH with the venv python)
 ```
+
+`chatxdk` is pinned below 0.6: 0.6 replaces the `encrypt_stream` and `decrypt_stream` calls that `encrypt-media` and `decrypt-media` use. Rerunning the install line moves an existing venv to the latest 0.5.x.
 
 Provide a **Chat PIN** via env `CHAT_PIN` (e.g. your host’s secret store). Never echo it into logs or chat.
 
