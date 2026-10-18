@@ -34,6 +34,15 @@ CLI:
                           #            ~/.cache/xchat-grokbot-helper/media, mode 700)
                           # stdout: media[] with each decrypted file's path (mode 600), mime_type and
                           #         size_bytes, and errors keyed by media index
+  encrypt-media           # stdin: session-encrypt's conversation_id, events, conversation_key_events and
+                          #        signing_keys, plus "media": [{"input": PATH, "filename"?}]
+                          # input: a PNG, JPEG, GIF or WebP image of at most 5 MiB
+                          # --out-dir: where part files go (default ~/.cache/xchat-grokbot-helper/media)
+                          # --part-bytes: encrypted bytes per part, 65536 to 4194304 (the default)
+                          # stdout: upload_dir, and media[] with total_bytes (chat_media_upload_initialize),
+                          #         num_parts (finalize), parts[] (segment_index and a mode-600 file holding
+                          #         the base64 media for chat_media_upload_append), width, height and
+                          #         conversation_key_version; errors keyed by media index
   prepare-keys            # stdin: {"public_keys":[...], "conversation_id"?}
                           # public_keys entries: user_id, public_key (identity), key_version
                           # stdout: add_conversation_keys body fields (+ optional _local_conversation_key)
@@ -72,7 +81,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from chat_xdk import Chat, detect_mime_type
+from chat_xdk import Chat, detect_image_dimensions, detect_mime_type
 
 
 def _as_dict(obj: Any) -> dict[str, Any]:
@@ -1468,6 +1477,106 @@ def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[s
     return {"media": media, "errors": errors}
 
 
+_IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_MAX_PART_BYTES = 4 * 1024 * 1024
+# chat_media_upload_append takes segment_index 0-999; parts this big keep the largest image under that.
+_MIN_PART_BYTES = 64 * 1024
+
+
+def _read_image(path: str) -> tuple[bytes, str, int, int]:
+    """An image's bytes, MIME type, width and height.
+
+    Raises ValueError for anything but a PNG, JPEG, GIF or WebP image of at most 5 MiB.
+    """
+    if not path:
+        raise ValueError("needs input, the image's path")
+    size = Path(path).stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(f"image is {size} bytes, over the {_MAX_IMAGE_BYTES}-byte limit")
+    image = Path(path).read_bytes()
+    mime_type = detect_mime_type(image)
+    if mime_type not in _IMAGE_TYPES:
+        raise ValueError(f"not a PNG, JPEG, GIF or WebP image ({mime_type or 'unknown type'})")
+    dimensions = detect_image_dimensions(image)
+    if not dimensions:
+        raise ValueError(f"can't read the width and height of this {mime_type} image")
+    return image, mime_type, *dimensions
+
+
+def _current_conversation_key(chat: Chat, conversation_id: str, decrypted: dict[str, Any]) -> tuple[str, bytes]:
+    """Version and bytes of the key a new message in this conversation is encrypted under.
+
+    That is the SDK's cached key, which it only takes from a key change whose signature
+    verifies. Encrypting an empty message, which is never sent, names its version.
+    """
+    try:
+        version = chat.encrypt_message(conversation_id, "").conversation_key_version
+    except Exception as e:
+        raise SystemExit(
+            f"encrypt-media failed: {e}. Include the conversation's events, conversation_key_events and "
+            f"the senders' signing_keys, as for session-encrypt. A new conversation needs its first "
+            f"message (session-encrypt with prepare, then add_conversation_keys) before an image."
+        ) from e
+    keys = decrypted["conversation_keys"]
+    if "keys" in keys:
+        keys = keys.get("keys") or {}
+    if version not in keys:
+        raise SystemExit(f"no conversation key {version}; include meta.conversation_key_events")
+    return version, base64.b64decode(keys[version])
+
+
+def _encrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path, part_bytes: int) -> dict[str, Any]:
+    """Encrypt each image with the conversation key, as decrypt-media reverses, into upload parts.
+
+    Each part is a mode-600 file holding the base64 media for one chat_media_upload_append,
+    in a new mode-700 directory under out_dir.
+    """
+    conversation_id = _scalar(payload.get("conversation_id") or payload.get("id"))
+    if not conversation_id or not payload.get("media"):
+        raise SystemExit('stdin needs conversation_id and "media": [{"input": PATH}]')
+    version, key = _current_conversation_key(chat, conversation_id, _decrypt(chat, payload))
+    upload_dir: Path | None = None
+    media: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    for i, request in enumerate(payload["media"]):
+        path = str(request.get("input") or "")
+        try:
+            image, mime_type, width, height = _read_image(path)
+            encrypted = chat.encrypt_stream(image, key)
+            upload_dir = upload_dir or Path(tempfile.mkdtemp(prefix="upload-", dir=out_dir))
+            parts = []
+            for segment_index, start in enumerate(range(0, len(encrypted), part_bytes)):
+                part = upload_dir / f"image{i}-part{segment_index}.b64"
+                _write_private(part, base64.b64encode(encrypted[start : start + part_bytes]))
+                parts.append({"segment_index": segment_index, "path": str(part)})
+        except (OSError, ValueError) as e:
+            errors[str(i)] = str(e)
+            continue
+        media.append(
+            {
+                "input": path,
+                "filename": str(request.get("filename") or Path(path).name),
+                "mime_type": mime_type,
+                "width": width,
+                "height": height,
+                "size_bytes": len(image),
+                "total_bytes": len(encrypted),
+                "num_parts": len(parts),
+                "parts": parts,
+                "conversation_key_version": version,
+            }
+        )
+    return {"upload_dir": str(upload_dir) if upload_dir else None, "media": media, "errors": errors}
+
+
+def _part_bytes(value: str) -> int:
+    size = int(value)
+    if not _MIN_PART_BYTES <= size <= _MAX_PART_BYTES:
+        raise argparse.ArgumentTypeError(f"must be {_MIN_PART_BYTES} to {_MAX_PART_BYTES}")
+    return size
+
+
 def cmd_unlock_check(args: argparse.Namespace) -> None:
     chat, user_id, key_status = _open_session(args)
     print(
@@ -1495,6 +1604,12 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
 def cmd_decrypt_media(args: argparse.Namespace) -> None:
     chat, _ = _session_from_env(args)
     result = _decrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir))
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_encrypt_media(args: argparse.Namespace) -> None:
+    chat, _ = _session_from_env(args)
+    result = _encrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir), args.part_bytes)
     print(json.dumps(result, ensure_ascii=False))
 
 
@@ -1625,6 +1740,12 @@ def main() -> None:
         help="Decrypt saved chat_media_download results into files",
     )
     p_media.add_argument("--out-dir", default="")
+    p_upload = sub.add_parser(
+        "encrypt-media",
+        help="Encrypt images into chat_media_upload_append parts",
+    )
+    p_upload.add_argument("--out-dir", default="")
+    p_upload.add_argument("--part-bytes", type=_part_bytes, default=_MAX_PART_BYTES)
     p_enc = sub.add_parser(
         "encrypt",
         help="Encrypt text for send_chat_message (keys must already be warm)",
@@ -1651,6 +1772,8 @@ def main() -> None:
         cmd_decrypt(args)
     elif args.cmd == "decrypt-media":
         cmd_decrypt_media(args)
+    elif args.cmd == "encrypt-media":
+        cmd_encrypt_media(args)
     elif args.cmd == "encrypt":
         cmd_encrypt(args)
     elif args.cmd == "prepare-keys":
