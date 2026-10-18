@@ -39,6 +39,8 @@ Before crypto works:
 5. For media: the MCP `chat_media_download` result for the conversation `id` and the attachment's `media_hash_key`, saved to a file. The tool returns the encrypted bytes base64-encoded (`{"content_type", "size_bytes", "encoding": "base64", "data"}`), up to 16 MiB.
 6. To send an image: the chat media upload tools `chat_media_upload_initialize`, `chat_media_upload_append` and `chat_media_upload_finalize`, which need the `media.write` scope.
 
+Conversation ids: the MCP conversation tools (`get_chat_conversation_events`, `send_chat_message`, `add_conversation_keys`, `chat_media_download`, …) take a 1:1 id only in its hyphen form, `111-222`, and reject the colon form that events carry, `111:222`. The helper's stdin takes either form. `session-encrypt` prints `id` in the hyphen form, and `encrypt-media` prints `upload_conversation_id` in the colon form that the chat media upload tools take.
+
 Valid public-key field set used in practice:
 
 `public_key_version,public_key,signing_public_key,identity_public_key_signature,juicebox_config`
@@ -100,15 +102,16 @@ JSON
 # images to send: encrypt each under the conversation key into upload parts (see "Send an image")
 $PY $SCRIPT ... encrypt-media <<'JSON'
 {
-  "conversation_id": "111:222",
+  "conversation_id": "111-222",
   "events": ["..."],
   "conversation_key_events": ["..."],
   "signing_keys": {"data": [...]},
   "media": [{"input": "/path/to/photo.jpg"}]
 }
 JSON
-# stdout: upload_dir, media[] (total_bytes, num_parts, parts[] with segment_index and the path of a mode-600
-#         file holding that part's base64, width, height, filename, conversation_key_version),
+# stdout: upload_conversation_id (for chat_media_upload_initialize), upload_dir,
+#         media[] (total_bytes, num_parts, parts[] with segment_index and the path of a mode-600 file
+#         holding that part's base64, width, height, filename, conversation_key_version),
 #         errors (by media index: not a PNG, JPEG, GIF or WebP image, over 5 MiB, or unreadable)
 
 # first contact / empty thread — stdout is add_conversation_keys body
@@ -140,6 +143,8 @@ JSON
 - **Existing thread:** pass recent `events` + `conversation_key_events` + `signing_keys` so decrypt can warm the conversation key, then encrypt.
 - **Empty / first message:** set `prepare` (same shape as `prepare-keys` stdin). Output includes `add_conversation_keys` and `needs_add_conversation_keys_before_send: true`. Call API `add_conversation_keys` **before** `send_chat_message`. Strip any `_local_*` fields — never send those upstream.
 
+Output `id` is the conversation id in the hyphen form (`111-222`) that `send_chat_message` and `add_conversation_keys` take, whatever form the input used.
+
 Both `encrypt` and `session-encrypt` mark every `http://` or `https://` URL, email address, `@mention`, `#hashtag` and `$cashtag` in the text as a rich-text entity, as the X apps do, so they render as links.
 
 - **Reply, react, edit:** add one of `"reply_to": ID`, `"reaction": {"target": ID, "emoji": "👍", "remove"?: true}` or `"edit": ID` (with `text` as the new text). `ID` is the sequence id or message id of a message in `events`, which the helper needs to build the reply preview or name the target. A reaction needs no `text`. Output adds `action` (`message`, `reply`, `reaction`, `reaction_removed` or `edit`) and `target_sequence_id`. Send it with `send_chat_message` like any message. Give a new message a few seconds to arrive before editing it.
@@ -154,17 +159,17 @@ An image is uploaded encrypted under the conversation key, then a message points
 
 1. Fetch the thread's events (every page, with `meta.conversation_key_events`) and every sender's signing keys, as for a text reply.
 2. `encrypt-media` with those, the `conversation_id` and `"media": [{"input": "/path/to/photo.jpg"}]`. Each image must be a PNG, JPEG, GIF or WebP of at most 5 MiB. Each part holds at most 4 MiB of the encrypted image; `--part-bytes` makes parts smaller.
-3. `chat_media_upload_initialize` with the `conversation_id` (a 1:1 id in its colon form, `111:222`) and the image's `total_bytes`. Keep the `session_id`, `media_hash_key` and `conversation_id` it returns.
+3. `chat_media_upload_initialize` with `conversation_id` set to encrypt-media's `upload_conversation_id` (the colon form, `111:222`, which the upload tools take) and the image's `total_bytes`. Keep the `session_id`, `media_hash_key` and `conversation_id` it returns.
 4. `chat_media_upload_append` once per part: `id` is the `session_id`, `media` is the contents of the part's file, `segment_index` is the part's, plus the `conversation_id` and `media_hash_key` from step 3.
 5. `session-encrypt` with the same events and signing keys, an optional caption in `text`, and `media`: the image's `encrypt-media` result with the `media_hash_key` added. Keep the `message_id`.
 6. `chat_media_upload_finalize`: `id` is the `session_id`, plus `conversation_id`, `media_hash_key`, `num_parts` as a string (`"2"`) and the `message_id`. For a disappearing message, also pass its `ttl_msec` as a string.
-7. `send_chat_message` with `id`, `message_id`, `encoded_message_create_event` and `encoded_message_event_signature`, as for text.
+7. `send_chat_message` with step 5's `id` (the hyphen form, `111-222`), `message_id`, `encoded_message_create_event` and `encoded_message_event_signature`, as for text.
 8. Delete `upload_dir`.
 
 ```bash
 $PY $SCRIPT ... session-encrypt <<'JSON'
 {
-  "conversation_id": "111:222",
+  "conversation_id": "111-222",
   "text": "the chart",
   "events": ["..."],
   "conversation_key_events": ["..."],

@@ -985,6 +985,27 @@ class SessionEncryptActionTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 session_encrypt(**options)
 
+    def test_id_is_the_hyphen_form_send_chat_message_takes(self):
+        for conversation_id in ("1111:2222", "2222-1111", "1111"):
+            with self.subTest(conversation_id=conversation_id):
+                self.assertEqual(session_encrypt(conversation_id=conversation_id, text="hi")["id"], "1111-2222")
+
+
+class ConversationIdTest(unittest.TestCase):
+    def test_one_to_one_ids_canonicalize_as_chat_xdk_does(self):
+        cases = {
+            ("111-222", "111"): "111:222",
+            ("222-111", "111"): "111:222",
+            ("222:111", "111"): "111:222",
+            ("10-9", "9"): "9:10",
+            ("222", "111"): "111:222",
+            ("111", "111"): "111:111",
+            ("g2031597666757378493", "111"): "g2031597666757378493",
+        }
+        for (conversation_id, user_id), expected in cases.items():
+            with self.subTest(conversation_id=conversation_id, user_id=user_id):
+                self.assertEqual(xchat_lite._canonical_conversation_id(conversation_id, user_id), expected)
+
 
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
@@ -1236,8 +1257,8 @@ class EncryptMediaTest(unittest.TestCase):
         path.write_bytes(content)
         return str(path)
 
-    def run_encrypt(self, media: list, *argv: str, signing_keys=(SDK_KEY,)) -> dict:
-        stdin = {"conversation_id": "1111:2222", **encrypted_thread(list(signing_keys)), "media": media}
+    def run_encrypt(self, media: list, *argv: str, signing_keys=(SDK_KEY,), conversation_id="1111:2222") -> dict:
+        stdin = {"conversation_id": conversation_id, **encrypted_thread(list(signing_keys)), "media": media}
         result = run_cli("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.out), *argv, pin=PIN, stdin=stdin)
         self.assertNotIn(VECTORS["conversation_key"], json.dumps(result))
         return result
@@ -1271,6 +1292,13 @@ class EncryptMediaTest(unittest.TestCase):
             path = Path(part["path"])
             self.assertEqual((path.parent, stat.S_IMODE(path.stat().st_mode)), (upload_dir, 0o600))
             self.assertLessEqual(len(base64.b64decode(path.read_text())), 65536)
+
+    def test_upload_conversation_id_is_the_colon_form_the_upload_tools_take(self):
+        photo = self.saved("photo.png", png(1, 1))
+        for conversation_id in ("1111:2222", "2222-1111", "1111"):
+            with self.subTest(conversation_id=conversation_id):
+                result = self.run_encrypt([{"input": photo}], conversation_id=conversation_id)
+                self.assertEqual(result["upload_conversation_id"], "1111:2222")
 
     def test_parts_are_4_mib_by_default(self):
         [item] = self.run_encrypt([{"input": self.saved("big.png", png(4000, 3000, 4_500_000))}])["media"]

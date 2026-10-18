@@ -39,9 +39,10 @@ CLI:
                           # input: a PNG, JPEG, GIF or WebP image of at most 5 MiB
                           # --out-dir: where part files go (default ~/.cache/xchat-grokbot-helper/media)
                           # --part-bytes: encrypted bytes per part, 65536 to 4194304 (the default)
-                          # stdout: upload_dir, and media[] with total_bytes (chat_media_upload_initialize),
-                          #         num_parts (finalize), parts[] (segment_index and a mode-600 file holding
-                          #         the base64 media for chat_media_upload_append), width, height and
+                          # stdout: upload_conversation_id (the colon form the upload tools take), upload_dir,
+                          #         and media[] with total_bytes (chat_media_upload_initialize), num_parts
+                          #         (finalize), parts[] (segment_index and a mode-600 file holding the base64
+                          #         media for chat_media_upload_append), width, height and
                           #         conversation_key_version; errors keyed by media index
   prepare-keys            # stdin: {"public_keys":[...], "conversation_id"?}
                           # public_keys entries: user_id, public_key (identity), key_version
@@ -65,6 +66,7 @@ CLI:
                           #            encrypt-media's parts (pass its result); text may then be left out
                           # }
                           # stdout adds "action": message | reply | reaction | reaction_removed | edit
+                          # stdout "id" is the conversation id in the hyphen form send_chat_message takes
 """
 
 from __future__ import annotations
@@ -337,6 +339,22 @@ def _prep_to_add_keys(prep: dict[str, Any]) -> dict[str, Any]:
     if prep.get("conversation_key") is not None:
         out["_local_conversation_key_b64"] = _b64(prep["conversation_key"])
     return out
+
+
+def _canonical_conversation_id(conversation_id: str, user_id: str) -> str:
+    """A 1:1 conversation id as events carry it: the two user ids, smaller first, joined by a colon.
+
+    Takes a colon or hyphen pair in either order, or the other participant's bare user id.
+    Group ids come back unchanged.
+    """
+    pair = re.fullmatch(r"([0-9]+)[:-]([0-9]+)", conversation_id)
+    if pair:
+        ids = pair.groups()
+    elif re.fullmatch(r"[0-9]+", conversation_id) and re.fullmatch(r"[0-9]+", user_id):
+        ids = (conversation_id, user_id)
+    else:
+        return conversation_id
+    return ":".join(sorted(ids, key=lambda i: (len(i), i)))
 
 
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
@@ -1574,7 +1592,9 @@ def _current_conversation_key(chat: Chat, conversation_id: str, decrypted: dict[
     return version, base64.b64decode(keys[version])
 
 
-def _encrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path, part_bytes: int) -> dict[str, Any]:
+def _encrypt_media(
+    chat: Chat, user_id: str, payload: dict[str, Any], out_dir: Path, part_bytes: int
+) -> dict[str, Any]:
     """Encrypt each image with the conversation key, as decrypt-media reverses, into upload parts.
 
     Each part is a mode-600 file holding the base64 media for one chat_media_upload_append,
@@ -1615,7 +1635,13 @@ def _encrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path, part_byte
                 "conversation_key_version": version,
             }
         )
-    return {"upload_dir": str(upload_dir) if upload_dir else None, "media": media, "errors": errors}
+    return {
+        # The chat media upload tools take a 1:1 id in the colon form events carry.
+        "upload_conversation_id": _canonical_conversation_id(conversation_id, user_id),
+        "upload_dir": str(upload_dir) if upload_dir else None,
+        "media": media,
+        "errors": errors,
+    }
 
 
 def _part_bytes(value: str) -> int:
@@ -1656,8 +1682,8 @@ def cmd_decrypt_media(args: argparse.Namespace) -> None:
 
 
 def cmd_encrypt_media(args: argparse.Namespace) -> None:
-    chat, _ = _session_from_env(args)
-    result = _encrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir), args.part_bytes)
+    chat, user_id = _session_from_env(args)
+    result = _encrypt_media(chat, user_id, json.load(sys.stdin), _media_dir(args.out_dir), args.part_bytes)
     print(json.dumps(result, ensure_ascii=False))
 
 
@@ -1696,7 +1722,7 @@ def cmd_prepare_keys(args: argparse.Namespace) -> None:
 
 def cmd_session_encrypt(args: argparse.Namespace) -> None:
     """Warm conversation keys then encrypt in one Chat session (preferred for send)."""
-    chat, _ = _session_from_env(args)
+    chat, user_id = _session_from_env(args)
     body = json.load(sys.stdin)
     conversation_id = body.get("conversation_id") or body.get("id")
     text = body.get("text")
@@ -1749,7 +1775,8 @@ def cmd_session_encrypt(args: argparse.Namespace) -> None:
         ) from e
 
     out: dict[str, Any] = {
-        "id": conversation_id,
+        # MCP conversation calls such as send_chat_message take a 1:1 id only in its hyphen form.
+        "id": _canonical_conversation_id(_scalar(conversation_id), user_id).replace(":", "-"),
         **send_fields,
     }
     if prepared_add is not None:
