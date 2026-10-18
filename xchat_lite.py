@@ -34,6 +34,17 @@ CLI:
                           #            ~/.cache/xchat-grokbot-helper/media, mode 700)
                           # stdout: media[] with each decrypted file's path (mode 600), mime_type and
                           #         size_bytes, and errors keyed by media index
+  encrypt-media           # stdin: session-encrypt's conversation_id, events, conversation_key_events and
+                          #        signing_keys, plus "media": [{"input": PATH, "filename"?}]
+                          # events: pages only up to the one holding the latest key change
+                          # input: a PNG, JPEG, GIF or WebP image of at most 5 MiB
+                          # --out-dir: where part files go (default ~/.cache/xchat-grokbot-helper/media)
+                          # --part-bytes: encrypted bytes per part, 65536 to 4194304 (the default)
+                          # stdout: upload_conversation_id (the colon form the upload tools take), upload_dir,
+                          #         and media[] with total_bytes (chat_media_upload_initialize), num_parts
+                          #         (finalize), parts[] (segment_index and a mode-600 file holding the base64
+                          #         media for chat_media_upload_append), width, height and
+                          #         conversation_key_version; errors keyed by media index
   prepare-keys            # stdin: {"public_keys":[...], "conversation_id"?}
                           # public_keys entries: user_id, public_key (identity), key_version
                           # stdout: add_conversation_keys body fields (+ optional _local_conversation_key)
@@ -51,8 +62,12 @@ CLI:
                           #   "edit": "SEQ_OR_MESSAGE_ID",       # optional: text replaces that message's text
                           #   "reaction": {"target": "SEQ_OR_MESSAGE_ID", "emoji": "👍", "remove"?: true},
                           #   "attachments": [...], "ttl_msec": N, "should_notify": false  # optional, chat-xdk shapes
+                          #   "media": [{"media_hash_key": "...", "input": PATH, "filename"?,
+                          #              "conversation_key_version"?}]  # optional: images uploaded from
+                          #            encrypt-media's parts (pass its result); text may then be left out
                           # }
                           # stdout adds "action": message | reply | reaction | reaction_removed | edit
+                          # stdout "id" is the conversation id in the hyphen form send_chat_message takes
 """
 
 from __future__ import annotations
@@ -72,7 +87,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from chat_xdk import Chat, detect_mime_type
+from chat_xdk import Chat, detect_image_dimensions, detect_mime_type
 
 
 def _as_dict(obj: Any) -> dict[str, Any]:
@@ -327,6 +342,22 @@ def _prep_to_add_keys(prep: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _canonical_conversation_id(conversation_id: str, user_id: str) -> str:
+    """A 1:1 conversation id as events carry it: the two user ids, smaller first, joined by a colon.
+
+    Takes a colon or hyphen pair in either order, or the other participant's bare user id.
+    Group ids come back unchanged.
+    """
+    pair = re.fullmatch(r"([0-9]+)[:-]([0-9]+)", conversation_id)
+    if pair:
+        ids = pair.groups()
+    elif re.fullmatch(r"[0-9]+", conversation_id) and re.fullmatch(r"[0-9]+", user_id):
+        ids = (conversation_id, user_id)
+    else:
+        return conversation_id
+    return ":".join(sorted(ids, key=lambda i: (len(i), i)))
+
+
 _URL = re.compile(r"https?://[^\s<>\"'`]+")
 _URL_TRAILING = ".,;:!?'\")]}*_"
 
@@ -423,8 +454,9 @@ def _send_fields(payload: Any) -> dict[str, str]:
     }
 
 
-# session-encrypt options passed straight to encrypt_message / encrypt_reply.
-_MESSAGE_OPTIONS = ("attachments", "ttl_msec", "should_notify")
+# session-encrypt options for a message or a reply. All but media pass straight to
+# encrypt_message / encrypt_reply.
+_MESSAGE_OPTIONS = ("attachments", "media", "ttl_msec", "should_notify")
 
 
 def _target_message(decrypted: dict[str, Any] | None, target: str) -> dict[str, Any]:
@@ -471,6 +503,8 @@ def _encrypt_action(
                 "target_sequence_id": target["event"].get("sequence_id")}
     if reaction is not None:
         raise SystemExit("reaction must be an object with target and emoji")
+    if text is None and options.get("media"):
+        text = ""
     if not isinstance(text, str):
         raise SystemExit("stdin needs conversation_id and text")
     entities = _text_entities(text) or None
@@ -478,6 +512,9 @@ def _encrypt_action(
         target = _target_message(decrypted, edit)
         fields = _send_fields(chat.encrypt_edit(target["original_b64"], text, entities=entities, **enc_kwargs))
         return {**fields, "action": "edit", "target_sequence_id": target["event"].get("sequence_id")}
+    media = options.pop("media", None) or []
+    if media:
+        options["attachments"] = [*(options.get("attachments") or []), *map(_media_attachment, media)]
     if reply_to:
         target = _target_message(decrypted, reply_to)
         ckces = _reply_key_events(body, decrypted or {}, target)
@@ -485,8 +522,18 @@ def _encrypt_action(
             conversation_id, text, target["original_b64"],
             reply_to_ckces=ckces or None, entities=entities, **options, **enc_kwargs,
         )
-        return {**_send_fields(payload), "action": "reply", "target_sequence_id": target["event"].get("sequence_id")}
-    return {**_encrypt_payload(chat, conversation_id, text, **options, **enc_kwargs), "action": "message"}
+        action = {"action": "reply", "target_sequence_id": target["event"].get("sequence_id")}
+    else:
+        payload = chat.encrypt_message(conversation_id, text, entities=entities, **options, **enc_kwargs)
+        action = {"action": "message"}
+    for entry in media:
+        version = _scalar(entry.get("conversation_key_version"))
+        if version and version != payload.conversation_key_version:
+            raise SystemExit(
+                f"the image was encrypted under conversation key {version}, but the message is under "
+                f"{payload.conversation_key_version}; run encrypt-media again with the same events"
+            )
+    return {**_send_fields(payload), **action}
 
 
 def _scalar(value: Any) -> str:
@@ -1468,6 +1515,144 @@ def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[s
     return {"media": media, "errors": errors}
 
 
+_IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+_MAX_PART_BYTES = 4 * 1024 * 1024
+# chat_media_upload_append takes segment_index 0-999; parts this big keep the largest image under that.
+_MIN_PART_BYTES = 64 * 1024
+
+
+def _read_image(path: str) -> tuple[bytes, str, int, int]:
+    """An image's bytes, MIME type, width and height.
+
+    Raises ValueError for anything but a PNG, JPEG, GIF or WebP image of at most 5 MiB.
+    """
+    if not path:
+        raise ValueError("needs input, the image's path")
+    size = Path(path).stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ValueError(f"image is {size} bytes, over the {_MAX_IMAGE_BYTES}-byte limit")
+    image = Path(path).read_bytes()
+    mime_type = detect_mime_type(image)
+    if mime_type not in _IMAGE_TYPES:
+        raise ValueError(f"not a PNG, JPEG, GIF or WebP image ({mime_type or 'unknown type'})")
+    dimensions = detect_image_dimensions(image)
+    if not dimensions:
+        raise ValueError(f"can't read the width and height of this {mime_type} image")
+    return image, mime_type, *dimensions
+
+
+def _encrypted_size(size: int) -> int:
+    """Bytes encrypt_stream makes of `size` bytes: a 24-byte header plus 17 per 1024-byte chunk."""
+    return 24 + size + 17 * -(-size // 1024)
+
+
+def _media_attachment(entry: Any) -> dict[str, Any]:
+    """chat-xdk attachment for a session-encrypt media entry: an image uploaded under its media_hash_key."""
+    if not isinstance(entry, dict):
+        raise SystemExit("each media entry needs media_hash_key and input")
+    media_hash_key = _scalar(entry.get("media_hash_key"))
+    if not media_hash_key:
+        raise SystemExit("each media entry needs the media_hash_key from chat_media_upload_initialize")
+    path = str(entry.get("input") or "")
+    try:
+        image, _, width, height = _read_image(path)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"media {media_hash_key}: {e}") from e
+    return {
+        "attachment_type": "media",
+        "media_hash_key": media_hash_key,
+        "width": width,
+        "height": height,
+        # Receivers take filesize_bytes as the size of the encrypted download.
+        "filesize_bytes": _encrypted_size(len(image)),
+        "filename": str(entry.get("filename") or Path(path).name),
+        "media_type": 1,  # image
+    }
+
+
+def _current_conversation_key(chat: Chat, conversation_id: str, decrypted: dict[str, Any]) -> tuple[str, bytes]:
+    """Version and bytes of the key a new message in this conversation is encrypted under.
+
+    That is the SDK's cached key, which it only takes from a key change whose signature
+    verifies. Encrypting an empty message, which is never sent, names its version.
+    """
+    try:
+        version = chat.encrypt_message(conversation_id, "").conversation_key_version
+    except Exception as e:
+        raise SystemExit(
+            f"encrypt-media failed: {e}. Include the conversation's latest key change (page events "
+            f"until one page has it in data or meta.conversation_key_events) and its sender's "
+            f"signing_keys. A new conversation needs its first message (session-encrypt with "
+            f"prepare, then add_conversation_keys) before an image."
+        ) from e
+    keys = decrypted["conversation_keys"]
+    if "keys" in keys:
+        keys = keys.get("keys") or {}
+    if version not in keys:
+        raise SystemExit(f"no conversation key {version}; include meta.conversation_key_events")
+    return version, base64.b64decode(keys[version])
+
+
+def _encrypt_media(
+    chat: Chat, user_id: str, payload: dict[str, Any], out_dir: Path, part_bytes: int
+) -> dict[str, Any]:
+    """Encrypt each image with the conversation key, as decrypt-media reverses, into upload parts.
+
+    Each part is a mode-600 file holding the base64 media for one chat_media_upload_append,
+    in a new mode-700 directory under out_dir.
+    """
+    conversation_id = _scalar(payload.get("conversation_id") or payload.get("id"))
+    if not conversation_id or not payload.get("media"):
+        raise SystemExit('stdin needs conversation_id and "media": [{"input": PATH}]')
+    version, key = _current_conversation_key(chat, conversation_id, _decrypt(chat, payload))
+    upload_dir: Path | None = None
+    media: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    for i, request in enumerate(payload["media"]):
+        path = str(request.get("input") or "")
+        try:
+            image, mime_type, width, height = _read_image(path)
+            encrypted = chat.encrypt_stream(image, key)
+            upload_dir = upload_dir or Path(tempfile.mkdtemp(prefix="upload-", dir=out_dir))
+            parts = []
+            for segment_index, start in enumerate(range(0, len(encrypted), part_bytes)):
+                part = upload_dir / f"image{i}-part{segment_index}.b64"
+                _write_private(part, base64.b64encode(encrypted[start : start + part_bytes]))
+                parts.append({"segment_index": segment_index, "path": str(part)})
+        except (OSError, ValueError) as e:
+            errors[str(i)] = str(e)
+            continue
+        media.append(
+            {
+                "input": path,
+                "filename": str(request.get("filename") or Path(path).name),
+                "mime_type": mime_type,
+                "width": width,
+                "height": height,
+                "size_bytes": len(image),
+                "total_bytes": len(encrypted),
+                "num_parts": len(parts),
+                "parts": parts,
+                "conversation_key_version": version,
+            }
+        )
+    return {
+        # The chat media upload tools take a 1:1 id in the colon form events carry.
+        "upload_conversation_id": _canonical_conversation_id(conversation_id, user_id),
+        "upload_dir": str(upload_dir) if upload_dir else None,
+        "media": media,
+        "errors": errors,
+    }
+
+
+def _part_bytes(value: str) -> int:
+    size = int(value)
+    if not _MIN_PART_BYTES <= size <= _MAX_PART_BYTES:
+        raise argparse.ArgumentTypeError(f"must be {_MIN_PART_BYTES} to {_MAX_PART_BYTES}")
+    return size
+
+
 def cmd_unlock_check(args: argparse.Namespace) -> None:
     chat, user_id, key_status = _open_session(args)
     print(
@@ -1495,6 +1680,12 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
 def cmd_decrypt_media(args: argparse.Namespace) -> None:
     chat, _ = _session_from_env(args)
     result = _decrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir))
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_encrypt_media(args: argparse.Namespace) -> None:
+    chat, user_id = _session_from_env(args)
+    result = _encrypt_media(chat, user_id, json.load(sys.stdin), _media_dir(args.out_dir), args.part_bytes)
     print(json.dumps(result, ensure_ascii=False))
 
 
@@ -1533,11 +1724,11 @@ def cmd_prepare_keys(args: argparse.Namespace) -> None:
 
 def cmd_session_encrypt(args: argparse.Namespace) -> None:
     """Warm conversation keys then encrypt in one Chat session (preferred for send)."""
-    chat, _ = _session_from_env(args)
+    chat, user_id = _session_from_env(args)
     body = json.load(sys.stdin)
     conversation_id = body.get("conversation_id") or body.get("id")
     text = body.get("text")
-    if not conversation_id or (text is None and not body.get("reaction")):
+    if not conversation_id or (text is None and not body.get("reaction") and not body.get("media")):
         raise SystemExit("stdin needs conversation_id and text")
 
     # Optional: first-contact / empty thread key init (local only until MCP add_conversation_keys)
@@ -1586,7 +1777,8 @@ def cmd_session_encrypt(args: argparse.Namespace) -> None:
         ) from e
 
     out: dict[str, Any] = {
-        "id": conversation_id,
+        # MCP conversation calls such as send_chat_message take a 1:1 id only in its hyphen form.
+        "id": _canonical_conversation_id(_scalar(conversation_id), user_id).replace(":", "-"),
         **send_fields,
     }
     if prepared_add is not None:
@@ -1625,6 +1817,12 @@ def main() -> None:
         help="Decrypt saved chat_media_download results into files",
     )
     p_media.add_argument("--out-dir", default="")
+    p_upload = sub.add_parser(
+        "encrypt-media",
+        help="Encrypt images into chat_media_upload_append parts",
+    )
+    p_upload.add_argument("--out-dir", default="")
+    p_upload.add_argument("--part-bytes", type=_part_bytes, default=_MAX_PART_BYTES)
     p_enc = sub.add_parser(
         "encrypt",
         help="Encrypt text for send_chat_message (keys must already be warm)",
@@ -1651,6 +1849,8 @@ def main() -> None:
         cmd_decrypt(args)
     elif args.cmd == "decrypt-media":
         cmd_decrypt_media(args)
+    elif args.cmd == "encrypt-media":
+        cmd_encrypt_media(args)
     elif args.cmd == "encrypt":
         cmd_encrypt(args)
     elif args.cmd == "prepare-keys":

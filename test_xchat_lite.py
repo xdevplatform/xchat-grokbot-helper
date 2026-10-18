@@ -985,6 +985,27 @@ class SessionEncryptActionTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 session_encrypt(**options)
 
+    def test_id_is_the_hyphen_form_send_chat_message_takes(self):
+        for conversation_id in ("1111:2222", "2222-1111", "1111"):
+            with self.subTest(conversation_id=conversation_id):
+                self.assertEqual(session_encrypt(conversation_id=conversation_id, text="hi")["id"], "1111-2222")
+
+
+class ConversationIdTest(unittest.TestCase):
+    def test_one_to_one_ids_canonicalize_as_chat_xdk_does(self):
+        cases = {
+            ("111-222", "111"): "111:222",
+            ("222-111", "111"): "111:222",
+            ("222:111", "111"): "111:222",
+            ("10-9", "9"): "9:10",
+            ("222", "111"): "111:222",
+            ("111", "111"): "111:111",
+            ("g2031597666757378493", "111"): "g2031597666757378493",
+        }
+        for (conversation_id, user_id), expected in cases.items():
+            with self.subTest(conversation_id=conversation_id, user_id=user_id):
+                self.assertEqual(xchat_lite._canonical_conversation_id(conversation_id, user_id), expected)
+
 
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
@@ -1205,6 +1226,228 @@ class DecryptMediaTest(unittest.TestCase):
         self.assertEqual(Path(result["media"][0]["path"]), media_dir / "hashkey.png")
         self.assertEqual((media_dir / "hashkey.png").read_bytes(), PNG)
         self.assertEqual(stat.S_IMODE(media_dir.stat().st_mode), 0o700)
+
+
+def png(width: int, height: int, size: int = 64) -> bytes:
+    """A PNG header for this width and height, padded to `size` bytes."""
+    header = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + struct.pack(">II", width, height)
+    return header + bytes(size - len(header))
+
+
+# A JPEG start of frame for 640x480, and a GIF header for 320x240.
+JPEG = bytes.fromhex("ffd8ffc000110801e0028003") + bytes(20)
+GIF = b"GIF89a" + struct.pack("<HH", 320, 240) + bytes(20)
+
+
+def parts_bytes(item: dict) -> bytes:
+    """The encrypted image an encrypt-media result's part files add up to."""
+    return b"".join(base64.b64decode(Path(part["path"]).read_text()) for part in item["parts"])
+
+
+class EncryptMediaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.out = self.tmp / "out"
+        self.key = base64.b64decode(VECTORS["conversation_key"])
+
+    def saved(self, name: str, content: bytes) -> str:
+        path = self.tmp / name
+        path.write_bytes(content)
+        return str(path)
+
+    def run_encrypt(self, media: list, *argv: str, signing_keys=(SDK_KEY,), conversation_id="1111:2222") -> dict:
+        stdin = {"conversation_id": conversation_id, **encrypted_thread(list(signing_keys)), "media": media}
+        result = run_cli("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.out), *argv, pin=PIN, stdin=stdin)
+        self.assertNotIn(VECTORS["conversation_key"], json.dumps(result))
+        return result
+
+    def test_parts_add_up_to_the_image_encrypted_with_the_conversation_key(self):
+        image = png(640, 480, 200_000)
+        result = self.run_encrypt([{"input": self.saved("photo.png", image)}], "--part-bytes", "65536")
+
+        self.assertEqual(result["errors"], {})
+        [item] = result["media"]
+        encrypted = parts_bytes(item)
+        self.assertEqual(chat_xdk.Chat().decrypt_stream(encrypted, self.key), image)
+        self.assertEqual(
+            {k: v for k, v in item.items() if k not in ("input", "parts")},
+            {
+                "filename": "photo.png",
+                "mime_type": "image/png",
+                "width": 640,
+                "height": 480,
+                "size_bytes": 200_000,
+                "total_bytes": len(encrypted),
+                "num_parts": 4,
+                "conversation_key_version": "1001",
+            },
+        )
+        upload_dir = Path(result["upload_dir"])
+        self.assertEqual(upload_dir.parent, self.out)
+        self.assertEqual(stat.S_IMODE(upload_dir.stat().st_mode), 0o700)
+        self.assertEqual([part["segment_index"] for part in item["parts"]], [0, 1, 2, 3])
+        for part in item["parts"]:
+            path = Path(part["path"])
+            self.assertEqual((path.parent, stat.S_IMODE(path.stat().st_mode)), (upload_dir, 0o600))
+            self.assertLessEqual(len(base64.b64decode(path.read_text())), 65536)
+
+    def test_upload_conversation_id_is_the_colon_form_the_upload_tools_take(self):
+        photo = self.saved("photo.png", png(1, 1))
+        for conversation_id in ("1111:2222", "2222-1111", "1111"):
+            with self.subTest(conversation_id=conversation_id):
+                result = self.run_encrypt([{"input": photo}], conversation_id=conversation_id)
+                self.assertEqual(result["upload_conversation_id"], "1111:2222")
+
+    def test_parts_are_4_mib_by_default(self):
+        [item] = self.run_encrypt([{"input": self.saved("big.png", png(4000, 3000, 4_500_000))}])["media"]
+        sizes = [len(base64.b64decode(Path(part["path"]).read_text())) for part in item["parts"]]
+        self.assertEqual(sizes, [4 * 1024 * 1024, item["total_bytes"] - 4 * 1024 * 1024])
+
+    def test_each_file_that_is_not_an_allowed_image_gets_an_error(self):
+        media = [
+            {"input": self.saved("doc.pdf", b"%PDF-1.4 not an image")},
+            {"input": self.saved("logo.bmp", b"BM" + bytes(30))},
+            {"input": self.saved("huge.png", png(1, 1, xchat_lite._MAX_IMAGE_BYTES + 1))},
+            {"input": self.saved("cut.png", png(1, 1)[:16])},
+            {"input": str(self.tmp / "missing.png")},
+            {},
+            {"input": self.saved("photo.jpg", JPEG), "filename": "IMG_0001.JPG"},
+            {"input": self.saved("wave.gif", GIF)},
+        ]
+        result = self.run_encrypt(media)
+
+        errors = result["errors"]
+        self.assertIn("No such file", errors.pop("4"))
+        self.assertEqual(
+            errors,
+            {
+                "0": "not a PNG, JPEG, GIF or WebP image (application/pdf)",
+                "1": "not a PNG, JPEG, GIF or WebP image (image/bmp)",
+                "2": f"image is {xchat_lite._MAX_IMAGE_BYTES + 1} bytes, over the {xchat_lite._MAX_IMAGE_BYTES}-byte limit",
+                "3": "can't read the width and height of this image/png image",
+                "5": "needs input, the image's path",
+            },
+        )
+        self.assertEqual(
+            [(m["filename"], m["mime_type"], m["width"], m["height"]) for m in result["media"]],
+            [("IMG_0001.JPG", "image/jpeg", 640, 480), ("wave.gif", "image/gif", 320, 240)],
+        )
+        self.assertEqual(
+            sorted(p.name for p in Path(result["upload_dir"]).iterdir()), ["image6-part0.b64", "image7-part0.b64"]
+        )
+
+    def test_the_latest_key_change_alone_is_enough(self):
+        photo = self.saved("photo.png", png(1, 1))
+        for where in ("conversation_key_events", "events"):
+            with self.subTest(where=where):
+                stdin = {
+                    "conversation_id": "1111-2222",
+                    where: [VECTORS["key_change_event"]],
+                    "signing_keys": [SDK_KEY],
+                    "media": [{"input": photo}],
+                }
+                result = run_cli("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.out), pin=PIN, stdin=stdin)
+                self.assertEqual((result["errors"], result["media"][0]["conversation_key_version"]), ({}, "1001"))
+
+    def test_needs_a_verified_conversation_key(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.run_encrypt([{"input": self.saved("photo.png", png(1, 1))}], signing_keys=())
+
+        self.assertIn("signing_keys", str(raised.exception))
+        self.assertEqual(list(self.out.iterdir()), [])
+
+
+class EncryptedSizeTest(unittest.TestCase):
+    def test_matches_encrypt_stream(self):
+        key = base64.b64decode(VECTORS["conversation_key"])
+        for size in (0, 1, 1023, 1024, 1025, 2048, 5000):
+            with self.subTest(size=size):
+                encrypted = chat_xdk.Chat().encrypt_stream(bytes(size), key)
+                self.assertEqual(xchat_lite._encrypted_size(size), len(encrypted))
+
+
+class SessionEncryptMediaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.photo = self.tmp / "photo.png"
+        self.photo.write_bytes(png(640, 480, 5000))
+        self.entry = {"media_hash_key": "AGgkIbPRTG", "input": str(self.photo)}
+
+    def saved(self, name: str, content: bytes) -> str:
+        path = self.tmp / name
+        path.write_bytes(content)
+        return str(path)
+
+    def test_media_is_sent_as_an_image_attachment(self):
+        fields = session_encrypt(text="look", media=[self.entry])
+        _, (variant, contents) = sent_create(fields)
+        [attachment] = contents[3]
+
+        self.assertEqual((fields["action"], variant, contents[1]), ("message", 1, b"look"))
+        self.assertTrue(fields["message_id"])
+        self.assertEqual(
+            attachment[1],
+            {1: b"AGgkIbPRTG", 2: {1: 640, 2: 480}, 3: 1, 5: xchat_lite._encrypted_size(5000), 6: b"photo.png"},
+        )
+        self.assertEqual(
+            xchat_lite._attachment_from_thrift(attachment),
+            {"filename": "photo.png", "attachment_type": "Media", "media_type": "image"},
+        )
+
+    def test_photo_without_a_caption_and_as_a_reply(self):
+        photo = session_encrypt(media=[self.entry])
+        reply = session_encrypt(text="here", reply_to="1", media=[{**self.entry, "filename": "chart.png"}])
+        _, (_, photo_contents) = sent_create(photo)
+        _, (_, reply_contents) = sent_create(reply)
+
+        self.assertEqual((photo["action"], photo_contents[1], photo_contents[3][0][1][6]), ("message", b"", b"photo.png"))
+        self.assertEqual(
+            (reply["action"], reply_contents[1], reply_contents[3][0][1][6], reply_contents[4][6]),
+            ("reply", b"here", b"chart.png", b"1"),
+        )
+
+    def test_bad_media_fails(self):
+        notes = self.tmp / "notes.txt"
+        notes.write_text("hello, not an image")
+        for options in (
+            {"media": [{"input": str(self.photo)}]},
+            {"media": [{**self.entry, "input": str(notes)}]},
+            {"media": ["AGgkIbPRTG"]},
+            {"text": "x", "edit": "1", "media": [self.entry]},
+            {"reaction": {"target": "1", "emoji": "👍"}, "media": [self.entry]},
+        ):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                session_encrypt(**options)
+
+    def test_media_encrypted_under_another_conversation_key_fails(self):
+        with self.assertRaises(SystemExit) as raised:
+            session_encrypt(text="look", media=[{**self.entry, "conversation_key_version": "1000"}])
+        self.assertIn("run encrypt-media again", str(raised.exception))
+
+    def test_encrypt_media_upload_reads_back_with_decrypt_media(self):
+        image = png(640, 480, 70_000)
+        stdin = {
+            "conversation_id": "1111:2222",
+            **encrypted_thread([SDK_KEY]),
+            "media": [{"input": self.saved("upload.png", image)}],
+        }
+        args = ("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.tmp / "up"), "--part-bytes", "65536")
+        [item] = run_cli(*args, pin=PIN, stdin=stdin)["media"]
+        sent = session_encrypt(text="look", media=[{**item, "media_hash_key": "AGgkIbPRTG"}])
+        event = _message_event(base64.b64decode(sent["encoded_message_create_event"]), "2222", "1111:2222")
+        thread = {"conversation_key_events": [VECTORS["key_change_event"]], "events": [event]}
+
+        self.assertEqual(texts(run_decrypt(thread))[-1], "[photo] look")
+        download = self.saved("download.json", json.dumps(tool_text(parts_bytes(item))).encode())
+        media = [{"media_hash_key": "AGgkIbPRTG", "input": download}]
+        result = run_cli("--juicebox", "{}", "decrypt-media", "--out-dir", str(self.tmp / "down"), pin=PIN,
+                         stdin={**thread, "media": media})
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(Path(result["media"][0]["path"]).read_bytes(), image)
 
 
 if __name__ == "__main__":
