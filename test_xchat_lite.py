@@ -1320,6 +1320,21 @@ class DecryptMediaTest(unittest.TestCase):
         self.assertIn("Decryption failed", result["errors"]["3"])
         self.assertEqual(list(self.tmp.glob("AGgkIbPRTG*")), [])
 
+    def test_media_of_a_message_read_here_is_found_by_its_hash_key(self):
+        thread = message_key_thread()
+        attachments = run_decrypt(thread)["messages"][-1]["event"]["attachments"]
+        self.assertEqual([a.get("media_hash_key") for a in attachments], ["hash-key"])
+
+        blob = chat_xdk.Chat().encrypt_stream(PNG, self.key)
+        result = self.run_media(
+            thread["events"],
+            [{"media_hash_key": "hash-key", "input": self.saved("result.json", tool_text(blob))}],
+            "--out-dir",
+            str(self.tmp),
+        )
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(Path(result["media"][0]["path"]).read_bytes(), PNG)
+
     def test_media_of_an_unencrypted_message_is_written_as_downloaded(self):
         event = plain_entry_event(1, _text(1, "look"), _list(3, media(1)))
         with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.tmp)}):
@@ -1498,7 +1513,7 @@ class SessionEncryptMediaTest(unittest.TestCase):
         )
         self.assertEqual(
             xchat_lite._attachment_from_thrift(attachment),
-            {"filename": "photo.png", "attachment_type": "Media", "media_type": "image"},
+            {"media_hash_key": "AGgkIbPRTG", "filename": "photo.png", "attachment_type": "Media", "media_type": "image"},
         )
 
     def test_photo_without_a_caption_and_as_a_reply(self):

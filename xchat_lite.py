@@ -874,7 +874,7 @@ _ATTACHMENT_TYPES = {
 }
 # Field ids of the labeled MessageAttachment variants, keyed by attachment field name.
 _ATTACHMENT_FIELDS = {
-    1: {"filename": 6},
+    1: {"media_hash_key": 1, "filename": 6},
     2: {"rest_id": 1, "post_url": 2},
     3: {"url": 1},
     4: {"url": 1},
@@ -1439,6 +1439,8 @@ def _media_message(
     messages: list[dict[str, Any]], media_hash_key: str
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """The decrypted event that references this media, with its media attachment ({} for a link image)."""
+    if not media_hash_key:
+        return None
     for message in messages:
         event = message.get("event") or {}
         attachment = next(
