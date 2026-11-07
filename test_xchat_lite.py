@@ -1099,6 +1099,43 @@ class SavedKeyTest(unittest.TestCase):
             self.assertFalse(self.key_file.exists())
             self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": False})
 
+    def test_failed_save_keeps_the_previous_key(self):
+        class ReadOnlyKeyring(FakeKeyring):
+            def set_password(self, service: str, name: str, password: str) -> None:
+                raise RuntimeError("keyring is read-only")
+
+        xchat_lite._write_saved_key("previous")
+        for keyring in (None, ReadOnlyKeyring()):
+            with (
+                self.subTest(keyring=type(keyring).__name__),
+                mock.patch.object(xchat_lite, "_keyring", lambda: keyring),
+                mock.patch.object(xchat_lite.os, "replace", side_effect=OSError("disk full")),
+                self.assertRaises(OSError),
+            ):
+                xchat_lite._write_saved_key("new")
+            self.assertEqual(self.key_file.read_text(), "previous")
+            self.assertEqual(list(self.key_file.parent.iterdir()), [self.key_file])
+
+    def test_stale_copy_is_removed_only_after_the_new_key_is_written(self):
+        class ReadOnlyKeyring(FakeKeyring):
+            def set_password(self, service: str, name: str, password: str) -> None:
+                raise RuntimeError("keyring is read-only")
+
+        keyring = ReadOnlyKeyring()
+        xchat_lite._write_saved_key("in the file")
+        with mock.patch.object(xchat_lite, "_keyring", lambda: keyring):
+            FakeKeyring.set_password(keyring, xchat_lite._SAVED_KEY_SERVICE, xchat_lite._SAVED_KEY_NAME, "in the keyring")
+            self.assertEqual(xchat_lite._read_saved_key(), "in the keyring")
+
+            xchat_lite._write_saved_key("new in the file")
+            self.assertEqual((keyring.passwords, xchat_lite._read_saved_key()), ({}, "new in the file"))
+
+        keyring = FakeKeyring()
+        with mock.patch.object(xchat_lite, "_keyring", lambda: keyring):
+            xchat_lite._write_saved_key("new in the keyring")
+            self.assertFalse(self.key_file.exists())
+            self.assertEqual(xchat_lite._read_saved_key(), "new in the keyring")
+
     def test_only_os_keyring_backends_are_used(self):
         def backend(module: str):
             return type("Backend", (), {"__module__": module})()
