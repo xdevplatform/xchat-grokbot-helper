@@ -985,10 +985,60 @@ class SessionEncryptActionTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 session_encrypt(**options)
 
+    def test_reply_or_edit_target_that_is_not_an_id_fails(self):
+        for name in ("reply_to", "edit"):
+            for target in ({"sequence_id": "1"}, ["1"], "", True):
+                with self.subTest(name=name, target=target), self.assertRaises(SystemExit) as raised:
+                    session_encrypt(text="x", **{name: target})
+                self.assertIn(name, str(raised.exception))
+
     def test_id_is_the_hyphen_form_send_chat_message_takes(self):
         for conversation_id in ("1111:2222", "2222-1111", "1111"):
             with self.subTest(conversation_id=conversation_id):
                 self.assertEqual(session_encrypt(conversation_id=conversation_id, text="hi")["id"], "1111-2222")
+
+
+class StdinShapeTest(unittest.TestCase):
+    def run_command(self, command: str, stdin) -> dict:
+        return run_cli("--juicebox", "{}", command, pin=PIN, stdin=stdin)
+
+    def test_stdin_that_is_not_an_object_fails_with_a_message(self):
+        for command in ("decrypt-media", "encrypt-media", "prepare-keys", "session-encrypt"):
+            for stdin in ([VECTORS["message_event"]], "text", None):
+                with self.subTest(command=command, stdin=stdin), self.assertRaises(SystemExit) as raised:
+                    self.run_command(command, stdin)
+                self.assertIn("JSON object", str(raised.exception))
+
+    def test_stdin_that_is_not_json_fails_with_a_message(self):
+        with (
+            mock.patch("sys.stdin", io.StringIO("{not json")),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            xchat_lite._stdin_json()
+        self.assertIn("not valid JSON", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_event_lists_that_are_not_lists_fail(self):
+        for name in ("events", "conversation_key_events"):
+            with self.subTest(name=name), self.assertRaises(SystemExit) as raised:
+                run_decrypt({name: VECTORS["message_event"]})
+            self.assertIn(name, str(raised.exception))
+
+    def test_media_entries_that_are_not_objects_get_an_error(self):
+        thread = encrypted_thread([SDK_KEY])
+        with tempfile.TemporaryDirectory() as tmp:
+            for command, stdin in (
+                ("decrypt-media", {**thread, "media": ["/tmp/photo.bin", 7]}),
+                ("encrypt-media", {"conversation_id": "1111:2222", **thread, "media": ["/tmp/photo.png", 7]}),
+            ):
+                with self.subTest(command=command):
+                    result = run_cli("--juicebox", "{}", command, "--out-dir", tmp, pin=PIN, stdin=stdin)
+                    self.assertEqual(result["media"], [])
+                    self.assertEqual(set(result["errors"]), {"0", "1"})
+                    self.assertIn("object", result["errors"]["0"])
+            with self.assertRaises(SystemExit) as raised:
+                run_cli("--juicebox", "{}", "decrypt-media", "--out-dir", tmp, pin=PIN, stdin={**thread, "media": "x"})
+            self.assertIn("media", str(raised.exception))
 
 
 class ConversationIdTest(unittest.TestCase):
