@@ -111,10 +111,17 @@ def _load_juicebox_config(raw: str) -> str:
     raw = (raw or "").strip()
     if not raw:
         raise SystemExit("Set --juicebox or XCHAT_JUICEBOX_JSON to a file path or JSON string")
-    path = Path(raw)
-    if path.is_file():
-        return path.read_text(encoding="utf-8")
-    return raw
+    # Inline JSON holds Juicebox auth tokens: never treat it as a path, whose errors echo it.
+    if raw.startswith("{"):
+        return raw
+    try:
+        return Path(raw).read_text(encoding="utf-8")
+    except (OSError, ValueError) as e:
+        reason = getattr(e, "strerror", None) or type(e).__name__
+        raise SystemExit(
+            f"Can't read the juicebox config file ({reason}); set --juicebox or XCHAT_JUICEBOX_JSON "
+            f"to the file's path or to the juicebox_config JSON itself"
+        ) from None
 
 
 def _load_pin() -> str:

@@ -1007,6 +1007,48 @@ class ConversationIdTest(unittest.TestCase):
                 self.assertEqual(xchat_lite._canonical_conversation_id(conversation_id, user_id), expected)
 
 
+class JuiceboxConfigTest(unittest.TestCase):
+    def unlock(self, juicebox: str) -> list[str]:
+        """Run unlock-check with this --juicebox and return the configs Chat was built with."""
+        configs = []
+
+        class ConfigChat(OfflineChat):
+            def __init__(self, juicebox_config: str = "") -> None:
+                configs.append(juicebox_config)
+                super().__init__(juicebox_config)
+
+        run_cli("--juicebox", juicebox, "unlock-check", pin=PIN, chat=ConfigChat)
+        return configs
+
+    def test_long_inline_config_reaches_the_sdk(self):
+        config = json.dumps(
+            {
+                "key_store_token_map_json": json.dumps({"realms": [{"id": "a" * 32, "address": "https://realm/"}]}),
+                "token_map": [{"key": "a" * 32, "value": {"address": "https://realm/", "token": "t" * 5000}}],
+            }
+        )
+        self.assertEqual(self.unlock(config), [config])
+        self.assertEqual(self.unlock(f"  {config}\n"), [config])
+
+    def test_config_file_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "juicebox.json")
+            path.write_text('{"token_map": []}')
+            self.assertEqual(self.unlock(str(path)), ['{"token_map": []}'])
+
+    def test_unreadable_config_file_fails_without_echoing_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in (str(Path(tmp, "missing.json")), tmp, "x" * 300):
+                with self.subTest(path=path[:40]):
+                    with self.assertRaises(SystemExit) as raised:
+                        self.unlock(path)
+                    message = str(raised.exception)
+                    self.assertIn("juicebox", message)
+                    self.assertNotIn(path, message)
+                    self.assertIsNone(raised.exception.__cause__)
+                    self.assertTrue(raised.exception.__suppress_context__)
+
+
 class SavedKeyTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()
