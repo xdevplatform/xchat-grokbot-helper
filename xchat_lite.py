@@ -486,6 +486,9 @@ def _encrypt_action(
     text = body.get("text")
     reaction = body.get("reaction")
     reply_to, edit = _scalar(body.get("reply_to")), _scalar(body.get("edit"))
+    for name, target in (("reply_to", reply_to), ("edit", edit)):
+        if body.get(name) is not None and not target:
+            raise SystemExit(f"{name} must be the sequence id or message id of a message in events")
     if sum(1 for option in (reaction, reply_to, edit) if option) > 1:
         raise SystemExit("pass only one of reply_to, reaction and edit")
     options = {name: body[name] for name in _MESSAGE_OPTIONS if body.get(name) is not None}
@@ -1286,6 +1289,9 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     """
     if isinstance(payload, list):
         payload = {"events": payload}
+    for name in ("conversation_key_events", "events", "encoded_events"):
+        if payload.get(name) and not isinstance(payload[name], list):
+            raise SystemExit(f"{name} must be a list of encoded events")
     raw_events = _dedupe_events(list(payload.get("conversation_key_events") or [])) + _dedupe_events(
         list(payload.get("events") or payload.get("encoded_events") or [])
     )
@@ -1466,19 +1472,30 @@ def _write_private(path: Path, data: bytes) -> None:
         raise
 
 
+def _media_requests(payload: dict[str, Any]) -> list[Any]:
+    requests = payload.get("media") or []
+    if not isinstance(requests, list):
+        raise SystemExit('"media" must be a list of objects, one per media')
+    return requests
+
+
 def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     """Decrypt each downloaded media with the conversation key of the message that references it.
 
     Media of a message without a conversation key version is stored unencrypted
     and is written as downloaded.
     """
+    requests = _media_requests(payload)
     decrypted = _decrypt(chat, payload)
     keys = decrypted["conversation_keys"]
     if "keys" in keys:
         keys = keys.get("keys") or {}
     media: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
-    for i, request in enumerate(payload.get("media") or []):
+    for i, request in enumerate(requests):
+        if not isinstance(request, dict):
+            errors[str(i)] = "each media entry must be an object with media_hash_key and input"
+            continue
         media_hash_key = str(request.get("media_hash_key") or "")
         try:
             found = _media_message(decrypted["messages"], media_hash_key)
@@ -1603,13 +1620,17 @@ def _encrypt_media(
     in a new mode-700 directory under out_dir.
     """
     conversation_id = _scalar(payload.get("conversation_id") or payload.get("id"))
-    if not conversation_id or not payload.get("media"):
+    requests = _media_requests(payload)
+    if not conversation_id or not requests:
         raise SystemExit('stdin needs conversation_id and "media": [{"input": PATH}]')
     version, key = _current_conversation_key(chat, conversation_id, _decrypt(chat, payload))
     upload_dir: Path | None = None
     media: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
-    for i, request in enumerate(payload["media"]):
+    for i, request in enumerate(requests):
+        if not isinstance(request, dict):
+            errors[str(i)] = 'each media entry must be an object such as {"input": PATH}'
+            continue
         path = str(request.get("input") or "")
         try:
             image, mime_type, width, height = _read_image(path)
@@ -1653,6 +1674,17 @@ def _part_bytes(value: str) -> int:
     return size
 
 
+def _stdin_json(allow_list: bool = False) -> Any:
+    """stdin's JSON object (or, with allow_list, a list); exits with a short message otherwise."""
+    try:
+        body = json.load(sys.stdin)
+    except ValueError as e:
+        raise SystemExit(f"stdin is not valid JSON ({e})") from None
+    if isinstance(body, dict) or (allow_list and isinstance(body, list)):
+        return body
+    raise SystemExit("stdin must be a JSON object" + (" or a list of events" if allow_list else ""))
+
+
 def cmd_unlock_check(args: argparse.Namespace) -> None:
     chat, user_id, key_status = _open_session(args)
     print(
@@ -1673,19 +1705,22 @@ def cmd_forget(args: argparse.Namespace) -> None:
 
 
 def cmd_decrypt(args: argparse.Namespace) -> None:
+    payload = _stdin_json(allow_list=True)
     chat, _ = _session_from_env(args)
-    print(json.dumps(_decrypt(chat, json.load(sys.stdin)), ensure_ascii=False))
+    print(json.dumps(_decrypt(chat, payload), ensure_ascii=False))
 
 
 def cmd_decrypt_media(args: argparse.Namespace) -> None:
+    payload = _stdin_json()
     chat, _ = _session_from_env(args)
-    result = _decrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir))
+    result = _decrypt_media(chat, payload, _media_dir(args.out_dir))
     print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_encrypt_media(args: argparse.Namespace) -> None:
+    payload = _stdin_json()
     chat, user_id = _session_from_env(args)
-    result = _encrypt_media(chat, user_id, json.load(sys.stdin), _media_dir(args.out_dir), args.part_bytes)
+    result = _encrypt_media(chat, user_id, payload, _media_dir(args.out_dir), args.part_bytes)
     print(json.dumps(result, ensure_ascii=False))
 
 
@@ -1707,8 +1742,8 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
 
 
 def cmd_prepare_keys(args: argparse.Namespace) -> None:
+    body = _stdin_json()
     chat, _ = _session_from_env(args)
-    body = json.load(sys.stdin)
     public_keys = body.get("public_keys") or []
     conversation_id = body.get("conversation_id")
     prep = chat.prepare_conversation_key_change(
@@ -1724,12 +1759,14 @@ def cmd_prepare_keys(args: argparse.Namespace) -> None:
 
 def cmd_session_encrypt(args: argparse.Namespace) -> None:
     """Warm conversation keys then encrypt in one Chat session (preferred for send)."""
-    chat, user_id = _session_from_env(args)
-    body = json.load(sys.stdin)
+    body = _stdin_json()
     conversation_id = body.get("conversation_id") or body.get("id")
     text = body.get("text")
     if not conversation_id or (text is None and not body.get("reaction") and not body.get("media")):
         raise SystemExit("stdin needs conversation_id and text")
+    if body.get("prepare") and not isinstance(body["prepare"], dict):
+        raise SystemExit('prepare must be an object such as {"public_keys": [...]}')
+    chat, user_id = _session_from_env(args)
 
     # Optional: first-contact / empty thread key init (local only until MCP add_conversation_keys)
     prepare_body = body.get("prepare")
