@@ -213,31 +213,53 @@ def _read_saved_key() -> str | None:
         return None
 
 
-def _forget_saved_key() -> bool:
-    """Delete the saved key from the key file and the OS keyring. True when there was one."""
-    forgotten = False
+def _forget_key_file() -> bool:
     try:
         _key_file().unlink()
-        forgotten = True
+        return True
     except FileNotFoundError:
-        pass
-    backend = _keyring()
-    if backend is not None and backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is not None:
+        return False
+
+
+def _forget_keyring_key(backend: Any) -> bool:
+    if backend is None:
+        return False
+    try:
+        if backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is None:
+            return False
         backend.delete_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME)
-        forgotten = True
-    return forgotten
+        return True
+    except Exception as e:
+        print(f"Could not reach the OS keyring to delete a saved X Chat key ({type(e).__name__}).", file=sys.stderr)
+        return False
+
+
+def _forget_saved_key() -> bool:
+    """Delete the saved key from the key file and the OS keyring. True when there was one."""
+    forgotten = _forget_key_file()
+    return _forget_keyring_key(_keyring()) or forgotten
 
 
 def _write_saved_key(saved: str) -> None:
-    """Store in the OS keyring, or in a mode-600 file in a mode-700 directory when that fails."""
-    _forget_saved_key()
+    """Store in the OS keyring, or in a mode-600 file in a mode-700 directory when that fails.
+
+    The copy in the other place is deleted only once the new key is stored, so a
+    failed save leaves the previous key in place.
+    """
     backend = _keyring()
     if backend is not None:
         try:
             backend.set_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME, saved)
-            return
         except Exception:
             pass
+        else:
+            _forget_key_file()
+            return
+    _write_key_file(saved)
+    _forget_keyring_key(backend)
+
+
+def _write_key_file(saved: str) -> None:
     path = _key_file()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.parent.chmod(0o700)
@@ -520,6 +542,9 @@ def _encrypt_action(
     text = body.get("text")
     reaction = body.get("reaction")
     reply_to, edit = _scalar(body.get("reply_to")), _scalar(body.get("edit"))
+    for name, target in (("reply_to", reply_to), ("edit", edit)):
+        if body.get(name) is not None and not target:
+            raise SystemExit(f"{name} must be the sequence id or message id of a message in events")
     if sum(1 for option in (reaction, reply_to, edit) if option) > 1:
         raise SystemExit("pass only one of reply_to, reaction and edit")
     options = {name: body[name] for name in _MESSAGE_OPTIONS if body.get(name) is not None}
@@ -958,7 +983,7 @@ _ATTACHMENT_TYPES = {
 }
 # Field ids of the labeled MessageAttachment variants, keyed by attachment field name.
 _ATTACHMENT_FIELDS = {
-    1: {"filename": 6},
+    1: {"media_hash_key": 1, "filename": 6},
     2: {"rest_id": 1, "post_url": 2},
     3: {"url": 1},
     4: {"url": 1},
@@ -1335,6 +1360,9 @@ def _decrypt(chat: Chat, payload: Any) -> dict[str, Any]:
     """
     if isinstance(payload, list):
         payload = {"events": payload}
+    for name in ("conversation_key_events", "events", "encoded_events"):
+        if payload.get(name) and not isinstance(payload[name], list):
+            raise SystemExit(f"{name} must be a list of encoded events")
     raw_events = _dedupe_events(list(payload.get("conversation_key_events") or [])) + _dedupe_events(
         list(payload.get("events") or payload.get("encoded_events") or [])
     )
@@ -1460,6 +1488,8 @@ def _media_message(
     messages: list[dict[str, Any]], media_hash_key: str
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """The decrypted row whose event references this media, with its media attachment ({} for a link image)."""
+    if not media_hash_key:
+        return None
     for message in messages:
         event = message.get("event") or {}
         attachment = next(
@@ -1515,12 +1545,20 @@ def _write_private(path: Path, data: bytes) -> None:
         raise
 
 
+def _media_requests(payload: dict[str, Any]) -> list[Any]:
+    requests = payload.get("media") or []
+    if not isinstance(requests, list):
+        raise SystemExit('"media" must be a list of objects, one per media')
+    return requests
+
+
 def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     """Decrypt each downloaded media with the conversation key of the message that references it.
 
     Media of a message without a conversation key version is stored unencrypted
     and is written as downloaded.
     """
+    requests = _media_requests(payload)
     decrypted = _decrypt(chat, payload)
     keys = decrypted["conversation_keys"]
     if "keys" in keys:
@@ -1528,7 +1566,10 @@ def _decrypt_media(chat: Chat, payload: dict[str, Any], out_dir: Path) -> dict[s
     raw_keys = {version: base64.b64decode(key) for version, key in keys.items()}
     media: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
-    for i, request in enumerate(payload.get("media") or []):
+    for i, request in enumerate(requests):
+        if not isinstance(request, dict):
+            errors[str(i)] = "each media entry must be an object with media_hash_key and input"
+            continue
         media_hash_key = str(request.get("media_hash_key") or "")
         try:
             found = _media_message(decrypted["messages"], media_hash_key)
@@ -1628,7 +1669,8 @@ def _prepare_media(chat: Chat, user_id: str, payload: dict[str, Any]) -> dict[st
     message that carries it is built, under the verified conversation key named here.
     """
     conversation_id = _scalar(payload.get("conversation_id") or payload.get("id"))
-    if not conversation_id or not payload.get("media"):
+    requests = _media_requests(payload)
+    if not conversation_id or not requests:
         raise SystemExit('stdin needs conversation_id and "media": [{"input": PATH}]')
     version = _decrypt(chat, payload)["conversation_keys"].get("latest_version")
     if not version:
@@ -1640,7 +1682,10 @@ def _prepare_media(chat: Chat, user_id: str, payload: dict[str, Any]) -> dict[st
         )
     media: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
-    for i, request in enumerate(payload["media"]):
+    for i, request in enumerate(requests):
+        if not isinstance(request, dict):
+            errors[str(i)] = 'each media entry must be an object such as {"input": PATH}'
+            continue
         path = str(request.get("input") or "")
         try:
             image, mime_type, width, height = _read_image(path)
@@ -1674,6 +1719,17 @@ def _part_bytes(value: str) -> int:
     return size
 
 
+def _stdin_json(allow_list: bool = False) -> Any:
+    """stdin's JSON object (or, with allow_list, a list); exits with a short message otherwise."""
+    try:
+        body = json.load(sys.stdin)
+    except ValueError as e:
+        raise SystemExit(f"stdin is not valid JSON ({e})") from None
+    if isinstance(body, dict) or (allow_list and isinstance(body, list)):
+        return body
+    raise SystemExit("stdin must be a JSON object" + (" or a list of events" if allow_list else ""))
+
+
 def cmd_unlock_check(args: argparse.Namespace) -> None:
     chat, user_id, key_status = _open_session(args)
     print(
@@ -1694,19 +1750,22 @@ def cmd_forget(args: argparse.Namespace) -> None:
 
 
 def cmd_decrypt(args: argparse.Namespace) -> None:
+    payload = _stdin_json(allow_list=True)
     chat, _ = _session_from_env(args)
-    print(json.dumps(_decrypt(chat, json.load(sys.stdin)), ensure_ascii=False))
+    print(json.dumps(_decrypt(chat, payload), ensure_ascii=False))
 
 
 def cmd_decrypt_media(args: argparse.Namespace) -> None:
+    payload = _stdin_json()
     chat, _ = _session_from_env(args)
-    result = _decrypt_media(chat, json.load(sys.stdin), _media_dir(args.out_dir))
+    result = _decrypt_media(chat, payload, _media_dir(args.out_dir))
     print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_prepare_media(args: argparse.Namespace) -> None:
+    payload = _stdin_json()
     chat, user_id = _session_from_env(args)
-    print(json.dumps(_prepare_media(chat, user_id, json.load(sys.stdin)), ensure_ascii=False))
+    print(json.dumps(_prepare_media(chat, user_id, payload), ensure_ascii=False))
 
 
 def cmd_encrypt_media(args: argparse.Namespace) -> None:
@@ -1734,8 +1793,8 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
 
 
 def cmd_prepare_keys(args: argparse.Namespace) -> None:
+    body = _stdin_json()
     chat, _ = _session_from_env(args)
-    body = json.load(sys.stdin)
     params = ConversationKeyChangeParams(
         _public_key_inputs(body.get("public_keys")), conversation_id=body.get("conversation_id")
     )
@@ -1744,12 +1803,14 @@ def cmd_prepare_keys(args: argparse.Namespace) -> None:
 
 def cmd_session_encrypt(args: argparse.Namespace) -> None:
     """Warm conversation keys then encrypt in one Chat session (preferred for send)."""
-    chat, user_id = _session_from_env(args)
-    body = json.load(sys.stdin)
+    body = _stdin_json()
     conversation_id = body.get("conversation_id") or body.get("id")
     text = body.get("text")
     if not conversation_id or (text is None and not body.get("reaction") and not body.get("media")):
         raise SystemExit("stdin needs conversation_id and text")
+    if body.get("prepare") and not isinstance(body["prepare"], dict):
+        raise SystemExit('prepare must be an object such as {"public_keys": [...]}')
+    chat, user_id = _session_from_env(args)
 
     # Optional: first-contact / empty thread key init (local only until MCP add_conversation_keys)
     prepare_body = body.get("prepare")

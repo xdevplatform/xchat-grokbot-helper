@@ -1032,10 +1032,60 @@ class SessionEncryptActionTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 session_encrypt(**options)
 
+    def test_reply_or_edit_target_that_is_not_an_id_fails(self):
+        for name in ("reply_to", "edit"):
+            for target in ({"sequence_id": "1"}, ["1"], "", True):
+                with self.subTest(name=name, target=target), self.assertRaises(SystemExit) as raised:
+                    session_encrypt(text="x", **{name: target})
+                self.assertIn(name, str(raised.exception))
+
     def test_id_is_the_hyphen_form_send_chat_message_takes(self):
         for conversation_id in ("1111:2222", "2222-1111", "1111"):
             with self.subTest(conversation_id=conversation_id):
                 self.assertEqual(session_encrypt(conversation_id=conversation_id, text="hi")["id"], "1111-2222")
+
+
+class StdinShapeTest(unittest.TestCase):
+    def run_command(self, command: str, stdin) -> dict:
+        return run_cli("--juicebox", "{}", command, pin=PIN, stdin=stdin)
+
+    def test_stdin_that_is_not_an_object_fails_with_a_message(self):
+        for command in ("decrypt-media", "prepare-media", "prepare-keys", "session-encrypt"):
+            for stdin in ([VECTORS["message_event"]], "text", None):
+                with self.subTest(command=command, stdin=stdin), self.assertRaises(SystemExit) as raised:
+                    self.run_command(command, stdin)
+                self.assertIn("JSON object", str(raised.exception))
+
+    def test_stdin_that_is_not_json_fails_with_a_message(self):
+        with (
+            mock.patch("sys.stdin", io.StringIO("{not json")),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            xchat_lite._stdin_json()
+        self.assertIn("not valid JSON", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+
+    def test_event_lists_that_are_not_lists_fail(self):
+        for name in ("events", "conversation_key_events"):
+            with self.subTest(name=name), self.assertRaises(SystemExit) as raised:
+                run_decrypt({name: VECTORS["message_event"]})
+            self.assertIn(name, str(raised.exception))
+
+    def test_media_entries_that_are_not_objects_get_an_error(self):
+        thread = encrypted_thread([SDK_KEY])
+        with tempfile.TemporaryDirectory() as tmp:
+            for command, stdin, argv in (
+                ("decrypt-media", {**thread, "media": ["/tmp/photo.bin", 7]}, ("--out-dir", tmp)),
+                ("prepare-media", {"conversation_id": "1111:2222", **thread, "media": ["/tmp/photo.png", 7]}, ()),
+            ):
+                with self.subTest(command=command):
+                    result = run_cli("--juicebox", "{}", command, *argv, pin=PIN, stdin=stdin)
+                    self.assertEqual(result["media"], [])
+                    self.assertEqual(set(result["errors"]), {"0", "1"})
+                    self.assertIn("object", result["errors"]["0"])
+            with self.assertRaises(SystemExit) as raised:
+                run_cli("--juicebox", "{}", "decrypt-media", "--out-dir", tmp, pin=PIN, stdin={**thread, "media": "x"})
+            self.assertIn("media", str(raised.exception))
 
 
 class ConversationIdTest(unittest.TestCase):
@@ -1171,6 +1221,59 @@ class SavedKeyTest(unittest.TestCase):
             self.assertEqual(run_cli("unlock-check", chat=NoUnlockChat)["key_source"], "saved")
             self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": True})
         self.assertEqual(keyring.passwords, {})
+
+    def test_failing_os_keyring_falls_back_to_the_key_file(self):
+        class LockedKeyring(FakeKeyring):
+            def get_password(self, service: str, name: str) -> str | None:
+                raise RuntimeError("keyring is locked")
+
+            def set_password(self, service: str, name: str, password: str) -> None:
+                raise RuntimeError("keyring is locked")
+
+        with mock.patch.object(xchat_lite, "_keyring", LockedKeyring):
+            self.assertTrue(self.remember()["key_saved"])
+            self.assertEqual(stat.S_IMODE(self.key_file.stat().st_mode), 0o600)
+            self.assertEqual(run_cli("unlock-check", chat=NoUnlockChat)["key_source"], "saved")
+            self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": True})
+            self.assertFalse(self.key_file.exists())
+            self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": False})
+
+    def test_failed_save_keeps_the_previous_key(self):
+        class ReadOnlyKeyring(FakeKeyring):
+            def set_password(self, service: str, name: str, password: str) -> None:
+                raise RuntimeError("keyring is read-only")
+
+        xchat_lite._write_saved_key("previous")
+        for keyring in (None, ReadOnlyKeyring()):
+            with (
+                self.subTest(keyring=type(keyring).__name__),
+                mock.patch.object(xchat_lite, "_keyring", lambda: keyring),
+                mock.patch.object(xchat_lite.os, "replace", side_effect=OSError("disk full")),
+                self.assertRaises(OSError),
+            ):
+                xchat_lite._write_saved_key("new")
+            self.assertEqual(self.key_file.read_text(), "previous")
+            self.assertEqual(list(self.key_file.parent.iterdir()), [self.key_file])
+
+    def test_stale_copy_is_removed_only_after_the_new_key_is_written(self):
+        class ReadOnlyKeyring(FakeKeyring):
+            def set_password(self, service: str, name: str, password: str) -> None:
+                raise RuntimeError("keyring is read-only")
+
+        keyring = ReadOnlyKeyring()
+        xchat_lite._write_saved_key("in the file")
+        with mock.patch.object(xchat_lite, "_keyring", lambda: keyring):
+            FakeKeyring.set_password(keyring, xchat_lite._SAVED_KEY_SERVICE, xchat_lite._SAVED_KEY_NAME, "in the keyring")
+            self.assertEqual(xchat_lite._read_saved_key(), "in the keyring")
+
+            xchat_lite._write_saved_key("new in the file")
+            self.assertEqual((keyring.passwords, xchat_lite._read_saved_key()), ({}, "new in the file"))
+
+        keyring = FakeKeyring()
+        with mock.patch.object(xchat_lite, "_keyring", lambda: keyring):
+            xchat_lite._write_saved_key("new in the keyring")
+            self.assertFalse(self.key_file.exists())
+            self.assertEqual(xchat_lite._read_saved_key(), "new in the keyring")
 
     def test_only_os_keyring_backends_are_used(self):
         def backend(module: str):
@@ -1337,6 +1440,14 @@ class DecryptMediaTest(unittest.TestCase):
         )
         self.assertIn("Decryption failed", result["errors"]["3"])
         self.assertEqual(list(self.tmp.glob("AGgkIbPRTG*")), [])
+
+    def test_media_attachments_keep_their_hash_key(self):
+        # chatxdk decodes per-message-key messages; the helper decodes Grok replies itself.
+        attachments = run_decrypt(message_key_thread())["messages"][-1]["event"]["attachments"]
+        self.assertEqual([a.get("media_hash_key") for a in attachments], ["hash-key"])
+        grok = _event(_variant(16, _text(6, "Look"), _field(STRING, 7, _string(_struct(_list(1, media(1)))))))
+        [row] = run_decrypt({"events": [grok]})["messages"]
+        self.assertEqual([a.get("media_hash_key") for a in row["event"]["attachments"]], ["hash-key"])
 
     def test_media_of_an_unencrypted_message_is_written_as_downloaded(self):
         event = plain_entry_event(1, _text(1, "look"), _list(3, media(1)))
@@ -1629,7 +1740,7 @@ class SessionEncryptMediaTest(unittest.TestCase):
         )
         self.assertEqual(
             xchat_lite._attachment_from_thrift(attachment),
-            {"filename": "photo.png", "attachment_type": "Media", "media_type": "image"},
+            {"media_hash_key": "AGgkIbPRTG", "filename": "photo.png", "attachment_type": "Media", "media_type": "image"},
         )
         [item] = fields["media"]
         self.assertEqual(
