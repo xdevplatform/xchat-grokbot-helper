@@ -20,7 +20,7 @@ python3 -m venv .venv
 # place xchat_lite.py in this directory (or anywhere on PATH with the venv python)
 ```
 
-`chatxdk` is pinned at 0.7.2, which needs Python 3.10 or newer. Rerunning the install line moves an existing venv from 0.5.x; the helper no longer runs on 0.5.x.
+`chatxdk` is pinned at 0.7.2 (also in `requirements.txt`, which CI installs), which needs Python 3.10 or newer. Rerunning the install line moves an existing venv from 0.5.x; the helper no longer runs on 0.5.x.
 
 `chatxdk` reads the X API's feature switches itself, with an anonymous `GET https://api.x.com/2/chat/features` (no credentials, no user data but the last four digits of the user id as `?bucket=`) on a background thread, again every 5 minutes while the process runs. When the X API turns `v1_send` on, messages, replies, reactions and edits are sent with per-message keys (v1); otherwise, or when that request is blocked, they are sent as before (v0). Apps on `chatxdk` 0.5.x can't read v1 messages.
 

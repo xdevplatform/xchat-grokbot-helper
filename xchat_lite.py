@@ -96,6 +96,7 @@ from typing import Any
 
 from chat_xdk import (
     Chat,
+    ChatXdkError,
     ConversationKeyChangeParams,
     DecryptEventsParams,
     DecryptFileParams,
@@ -105,6 +106,8 @@ from chat_xdk import (
     EncryptReactionParams,
     EncryptReplyParams,
     ImportKeysParams,
+    InvalidInputError,
+    InvalidPinError,
     SetIdentityParams,
     detect_image_dimensions,
     detect_mime_type,
@@ -307,10 +310,21 @@ def _open_session(args: argparse.Namespace) -> tuple[Chat, str, dict[str, Any]]:
             args.juicebox or os.environ.get("XCHAT_JUICEBOX_JSON", "")
         )
         chat = Chat(juicebox)
-        chat.unlock(pin)
+        try:
+            chat.unlock(pin)
+        except InvalidPinError as e:
+            left = getattr(e, "guesses_remaining", None)
+            raise SystemExit(
+                "The Chat PIN is wrong" + (f"; {left} guess(es) left before the keys lock" if left is not None else "")
+            ) from None
+        except ChatXdkError as e:
+            raise SystemExit(f"Could not unlock the X Chat keys ({getattr(e, 'kind', None) or 'error'}): {e}") from None
         saved = args.remember_key and _save_key(chat, user_id, version)
         key_status = {"key_source": "pin", "key_saved": saved}
-    chat.set_identity(SetIdentityParams(user_id, version))
+    try:
+        chat.set_identity(SetIdentityParams(user_id, version))
+    except InvalidInputError as e:
+        raise SystemExit(f"{e}. Pass the numeric --user-id and the --key-version get_users_public_key returns.") from None
     chat.set_cache_keys(True)
     return chat, user_id, key_status
 

@@ -782,6 +782,7 @@ class MessageKeyTest(unittest.TestCase):
         self.assertEqual((message["status"], message["text"]), ("unverified", "[photo] per-message key"))
         self.assertEqual(message["event"]["id"], "mid-1")
         self.assertEqual(message["event"]["conversation_key_version"], "1001")
+        self.assertEqual([a.get("media_hash_key") for a in message["event"]["attachments"]], ["hash-key"])
 
     def test_wrong_message_key_still_gets_a_placeholder(self):
         result = run_decrypt(message_key_thread(key_message_id="other"))
@@ -1140,6 +1141,42 @@ class SavedKeyTest(unittest.TestCase):
             self.assertIs(real_keyring_lookup(), os_keyring)
             fake_module.get_keyring = lambda: file_keyring
             self.assertIsNone(real_keyring_lookup())
+
+
+class UnlockErrorTest(unittest.TestCase):
+    def unlock_failing_with(self, error: Exception) -> str:
+        class FailingChat(OfflineChat):
+            def unlock(self, pin: str) -> None:
+                raise error
+
+        with self.assertRaises(SystemExit) as raised:
+            run_cli("--juicebox", "{}", "unlock-check", pin=PIN, chat=FailingChat)
+        self.assertTrue(raised.exception.__suppress_context__)
+        return str(raised.exception)
+
+    def test_wrong_pin_says_how_many_guesses_are_left(self):
+        wrong = chat_xdk.InvalidPinError("Invalid PIN")
+        wrong.guesses_remaining = 2
+        self.assertEqual(self.unlock_failing_with(wrong), "The Chat PIN is wrong; 2 guess(es) left before the keys lock")
+        uncounted = chat_xdk.InvalidPinError("Invalid PIN")
+        uncounted.guesses_remaining = None
+        self.assertEqual(self.unlock_failing_with(uncounted), "The Chat PIN is wrong")
+
+    def test_other_sdk_failures_are_one_line(self):
+        failure = chat_xdk.JuiceboxError("Juicebox error: Transient error")
+        failure.kind = "juicebox"
+        self.assertEqual(
+            self.unlock_failing_with(failure), "Could not unlock the X Chat keys (juicebox): Juicebox error: Transient error"
+        )
+
+    def test_a_user_id_that_is_not_numeric_fails_with_a_message(self):
+        with (
+            self.assertRaises(SystemExit) as raised,
+            mock.patch.object(xchat_lite, "Chat", OfflineChat),
+            mock.patch.dict(os.environ, {"CHAT_PIN": PIN}),
+        ):
+            xchat_lite._open_session(argparse.Namespace(user_id="me", key_version="1", juicebox="{}", remember_key=False))
+        self.assertIn("Invalid user_id 'me'", str(raised.exception))
 
 
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + b"pixels"
