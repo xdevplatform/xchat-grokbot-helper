@@ -9,6 +9,7 @@ import stat
 import struct
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -181,19 +182,31 @@ def unencrypted_message_event(
     return _message_event(create_event, sender_id, "111-222", event_id, sequence_id)
 
 
+def vector_chat() -> chat_xdk.Chat:
+    chat = chat_xdk.Chat()
+    chat.import_keys(chat_xdk.ImportKeysParams(base64.b64decode(VECTORS["private_keys"]), signing_key_version="1"))
+    return chat
+
+
+def vector_message(text: str, **options) -> chat_xdk.SendPayload:
+    """A message from the vector sender, encrypted under the vector conversation key."""
+    return vector_chat().encrypt_message(
+        chat_xdk.EncryptMessageParams(
+            "1111:2222",
+            text,
+            sender_id=SENDER_ID,
+            signing_key_version="1",
+            conversation_key=base64.b64decode(VECTORS["conversation_key"]),
+            conversation_key_version="1001",
+            **options,
+        )
+    )
+
+
 def unsigned_encrypted_message_event(text: str) -> str:
     """A message encrypted under the vector conversation key, with its signature left out."""
-    chat = chat_xdk.Chat()
-    chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
-    payload = chat.encrypt_message(
-        "1111:2222",
-        text,
-        sender_id=SENDER_ID,
-        signing_key_version="1",
-        conversation_key=base64.b64decode(VECTORS["conversation_key"]),
-        conversation_key_version="1001",
-    )
-    return _message_event(base64.b64decode(payload.encrypted_content), SENDER_ID, "1111:2222")
+    payload = vector_message(text)
+    return _message_event(base64.b64decode(payload.encoded_message_create_event), SENDER_ID, "1111:2222")
 
 
 def entry_holder(variant: int, *fields: bytes) -> bytes:
@@ -259,7 +272,8 @@ class OfflineChat:
         self._chat = chat_xdk.Chat()
 
     def unlock(self, pin: str) -> None:
-        self._chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
+        keys = base64.b64decode(VECTORS["private_keys"])
+        self._chat.import_keys(chat_xdk.ImportKeysParams(keys, signing_key_version="1"))
 
     def __getattr__(self, name: str):
         return getattr(self._chat, name)
@@ -282,9 +296,9 @@ class RecordingChat(OfflineChat):
         self.reject = reject
         self._chat.set_reject_unverified(reject)
 
-    def decrypt_events(self, events, signing_keys=None):
-        self.batches.append((self.reject, list(events)))
-        return self._chat.decrypt_events(events, signing_keys)
+    def decrypt_events(self, params):
+        self.batches.append((self.reject, list(params.events)))
+        return self._chat.decrypt_events(params)
 
 
 def run_decrypt(payload) -> dict:
@@ -309,6 +323,8 @@ def texts(result: dict) -> list[str]:
 
 
 PIN = "test-pin"
+# Nothing listens on the discard port.
+OFFLINE_FEATURES = "http://127.0.0.1:9/2/chat/features"
 
 
 def run_cli(*argv: str, pin: str = "", chat=OfflineChat, stdin=None) -> dict:
@@ -346,11 +362,15 @@ class FakeKeyring:
 
 
 def setUpModule() -> None:
-    """Keep every test away from the real keyring and ~/.config."""
+    """Keep every test away from the real keyring, ~/.config and the X API.
+
+    chatxdk reads its feature switches from api.x.com; with nothing answering, every chat sends v0.
+    """
+    chat_xdk._native._feature_set_default_endpoint(OFFLINE_FEATURES)
     config = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(config.cleanup)
     for patch in (
-        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}),
+        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name, "XDG_CACHE_HOME": config.name}),
         mock.patch.object(xchat_lite, "_keyring", lambda: None),
     ):
         patch.start()
@@ -530,7 +550,7 @@ class VerificationPolicyTest(unittest.TestCase):
 
         self.assertEqual(result["errors"], {})
         self.assertEqual(summary(result), [("Message", "unencrypted", "sent before encryption")])
-        self.assertIsNone(result["messages"][0]["event"]["key_version"])
+        self.assertIsNone(result["messages"][0]["event"]["conversation_key_version"])
         self.assertEqual(result["unverified_senders"], [])
 
     def test_encrypted_message_verifies_with_the_sender_key(self):
@@ -758,9 +778,10 @@ class MessageKeyTest(unittest.TestCase):
         result = run_decrypt(message_key_thread())
         message = result["messages"][-1]
         self.assertEqual(result["errors"], {})
+        # Unsigned, so unverified, but chatxdk opens it with the key derived from the sender and message id.
         self.assertEqual((message["status"], message["text"]), ("unverified", "[photo] per-message key"))
-        self.assertEqual(message["event"]["contents_encryption_version"], 1)
         self.assertEqual(message["event"]["id"], "mid-1")
+        self.assertEqual(message["event"]["conversation_key_version"], "1001")
 
     def test_wrong_message_key_still_gets_a_placeholder(self):
         result = run_decrypt(message_key_thread(key_message_id="other"))
@@ -777,7 +798,7 @@ class SystemEventTest(unittest.TestCase):
 
     def test_encrypted_group_title_and_description_are_opened(self):
         key = base64.b64decode(VECTORS["conversation_key"])
-        title, about = chat_xdk.Chat().encrypt("Secret Club", key), chat_xdk.Chat().encrypt("be nice", key)
+        title, about = (base64.b64encode(seal(key, text.encode())).decode() for text in ("Secret Club", "be nice"))
         payload = {
             "conversation_key_events": [VECTORS["key_change_event"]],
             "events": [
@@ -786,9 +807,16 @@ class SystemEventTest(unittest.TestCase):
             ],
         }
         rows = run_decrypt(payload)["messages"][1:]
-        self.assertEqual(rows[0]["event"]["change"]["new_title"], title)
+        self.assertEqual(rows[0]["event"]["change"]["new_title"], {"kind": "Text", "text": "Secret Club"})
         self.assertEqual(rows[0]["event"]["change"]["decrypted_title"], "Secret Club")
-        self.assertEqual(rows[1]["event"]["change"], {"change_type": "DescriptionChanged", "description": "be nice"})
+        self.assertEqual(
+            rows[1]["event"]["change"],
+            {
+                "change_type": "DescriptionChanged",
+                "new_description": {"kind": "Text", "text": "be nice"},
+                "description": "be nice",
+            },
+        )
         self.assertEqual([r["notice"] for r in rows], ["[renamed the group to Secret Club]", "[changed the group description: be nice]"])
         self.assertEqual([r["text"] for r in rows], ["", ""])
 
@@ -808,6 +836,23 @@ class SystemEventTest(unittest.TestCase):
             ],
         )
 
+    def test_key_rotation_reencryptions_are_skipped_not_errors(self):
+        key = base64.b64decode(VECTORS["conversation_key"])
+        title = base64.b64encode(seal(key, b"Secret Club")).decode()
+        reencrypted = _event(
+            _variant(4, _field(STRUCT, 1, _variant(2, _text(1, title), _text(2, "1001"))), _bool(2, True)),
+            sender_id=SENDER_ID,
+        )
+        payload = {"conversation_key_events": [VECTORS["key_change_event"]], "events": [reencrypted]}
+        result = run_decrypt(payload)
+
+        [row] = result["messages"][1:]
+        self.assertEqual((row["event"]["type"], row["text"], row["status"]), ("GroupChange", "", "unverified"))
+        self.assertIn("for_key_rotation", row["skipped"])
+        self.assertNotIn("error", row)
+        self.assertNotIn("notice", row)
+        self.assertEqual(result["errors"], {})
+
     def test_messages_and_receipts_get_no_notice(self):
         result = run_decrypt({"events": [unencrypted_message_event("hi"), _event(_variant(6))]})
         self.assertEqual([m.get("notice") for m in result["messages"]], [None, None])
@@ -818,16 +863,17 @@ class SystemEventTest(unittest.TestCase):
 
 
 class OpenBoxTest(unittest.TestCase):
-    def test_opens_what_the_sdk_encrypts(self):
+    def test_opens_the_boxes_the_sdk_opens(self):
         key = bytes(range(32))
         for text in ("", "a", "x" * 63, "y" * 64, "✓ " * 100):
             with self.subTest(length=len(text)):
-                box = base64.b64decode(chat_xdk.Chat().encrypt(text, key))
+                box = seal(key, text.encode())
+                self.assertEqual(chat_xdk.Chat().decrypt(base64.b64encode(box).decode(), key), text)
                 self.assertEqual(xchat_lite._open_box(key, box), text.encode())
 
     def test_rejects_a_wrong_key_or_a_tampered_box(self):
         key = bytes(range(32))
-        box = bytearray(base64.b64decode(chat_xdk.Chat().encrypt("hello", key)))
+        box = bytearray(seal(key, b"hello"))
 
         self.assertIsNone(xchat_lite._open_box(bytes(32), bytes(box)))
         box[-1] ^= 1
@@ -844,9 +890,8 @@ def sent_entities(fields: dict) -> list[tuple[int, int, int]]:
 
 
 def encrypt(text: str) -> dict:
-    chat = chat_xdk.Chat()
-    chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
-    chat.set_identity("1111", "1")
+    chat = vector_chat()
+    chat.set_identity(chat_xdk.SetIdentityParams("1111", "1"))
     key = base64.b64decode(VECTORS["conversation_key"])
     return xchat_lite._encrypt_payload(chat, "1111-2222", text, conversation_key=key, conversation_key_version="1001")
 
@@ -932,10 +977,10 @@ class RichTextEntityTest(unittest.TestCase):
         self.assertEqual(sent_entities(fields), [(0, 5, 3), (6, 10, 1), (11, 13, 2), (14, 20, 5), (21, 34, 4)])
 
 
-def session_encrypt(**options) -> dict:
-    """session-encrypt on the vector thread as user 2222, with these extra stdin options."""
+def session_encrypt(*argv: str, **options) -> dict:
+    """session-encrypt on the vector thread as user 2222, with these flags and extra stdin options."""
     body = {"conversation_id": "1111:2222", **encrypted_thread([SDK_KEY]), **options}
-    return run_cli("--juicebox", "{}", "session-encrypt", pin=PIN, stdin=body)
+    return run_cli("--juicebox", "{}", "session-encrypt", *argv, pin=PIN, stdin=body)
 
 
 def sent_create(fields: dict) -> tuple[dict, tuple[int, dict]]:
@@ -1100,30 +1145,29 @@ class SavedKeyTest(unittest.TestCase):
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + b"pixels"
 
 
-def encrypted_media_message(media_hash_key: str) -> str:
-    """An unsigned message encrypted under the vector conversation key, carrying one image."""
-    chat = chat_xdk.Chat()
-    chat.import_keys(base64.b64decode(VECTORS["private_keys"]), version="1")
-    payload = chat.encrypt_message(
-        "1111:2222",
-        "look",
-        sender_id=SENDER_ID,
-        signing_key_version="1",
-        conversation_key=base64.b64decode(VECTORS["conversation_key"]),
-        conversation_key_version="1001",
-        attachments=[
-            {
-                "attachment_type": "media",
-                "media_hash_key": media_hash_key,
-                "width": 1,
-                "height": 1,
-                "filesize_bytes": 100,
-                "filename": "IMG_0001.PNG",
-                "media_type": 1,
-            }
-        ],
+def encrypted_media_message(media_hash_key: str) -> tuple[str, bytes]:
+    """An unsigned message encrypted under the vector conversation key carrying one image, and PNG
+    encrypted as that image."""
+    attachment = {
+        "attachment_type": "media",
+        "media_hash_key": media_hash_key,
+        "width": 1,
+        "height": 1,
+        "filesize_bytes": chat_xdk.encrypted_file_size(len(PNG)),
+        "filename": "IMG_0001.PNG",
+        "media_type": 1,
+    }
+    payload = vector_message("look", attachments=[attachment])
+    blob = vector_chat().encrypt_file(
+        chat_xdk.EncryptFileParams(
+            PNG,
+            payload.event_b64,
+            media_hash_key,
+            conversation_key=base64.b64decode(VECTORS["conversation_key"]),
+            conversation_key_version="1001",
+        )
     )
-    return _message_event(base64.b64decode(payload.encrypted_content), SENDER_ID, "1111:2222")
+    return _message_event(base64.b64decode(payload.encoded_message_create_event), SENDER_ID, "1111:2222"), blob
 
 
 def tool_text(blob: bytes, **overrides) -> dict:
@@ -1148,7 +1192,6 @@ class DecryptMediaTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
-        self.key = base64.b64decode(VECTORS["conversation_key"])
 
     def saved(self, name: str, content) -> str:
         """Path of a file holding `content`: bytes as is, anything else as JSON."""
@@ -1160,8 +1203,8 @@ class DecryptMediaTest(unittest.TestCase):
         stdin = {"conversation_key_events": [VECTORS["key_change_event"]], "events": events, "media": media}
         return run_cli("--juicebox", "{}", "decrypt-media", *argv, pin=PIN, stdin=stdin)
 
-    def test_decrypts_a_downloaded_image_with_its_message_key(self):
-        blob = chat_xdk.Chat().encrypt_stream(PNG, self.key)
+    def test_decrypts_a_downloaded_image_with_its_message(self):
+        event, blob = encrypted_media_message("AGgkIbPRTG")
         saved_results = {
             "the tool text a harness saved": tool_text(blob),
             "a whole JSON-RPC response": {"jsonrpc": "2.0", "id": 1, "result": tool_result(tool_text(blob))},
@@ -1170,7 +1213,7 @@ class DecryptMediaTest(unittest.TestCase):
             with self.subTest(shape):
                 out_dir = self.tmp / shape.replace(" ", "-")
                 result = self.run_media(
-                    [encrypted_media_message("AGgkIbPRTG")],
+                    [event],
                     [{"media_hash_key": "AGgkIbPRTG", "input": self.saved("result.json", content)}],
                     "--out-dir",
                     str(out_dir),
@@ -1187,21 +1230,19 @@ class DecryptMediaTest(unittest.TestCase):
                 )
 
     def test_each_media_that_cannot_be_decrypted_gets_an_error(self):
-        blob = chat_xdk.Chat().encrypt_stream(PNG, self.key)
+        event, blob = encrypted_media_message("AGgkIbPRTG")
+        other_key = chat_xdk.Chat().encrypt_file_with_key(chat_xdk.EncryptFileWithKeyParams(PNG, os.urandom(32)))
         forbidden = {"title": "Forbidden", "detail": "Missing required OAuth2 scopes: media.write"}
         too_large = {**tool_result("Failed to read response body: length limit exceeded"), "isError": True}
         media = [
             {"media_hash_key": "AGgkIbPRTG", "input": self.saved("403.json", tool_result(forbidden))},
             {"media_hash_key": "AGgkIbPRTG", "input": self.saved("too-large.json", too_large)},
             {"media_hash_key": "AGgkIbPRTG", "input": self.saved("lossy.json", tool_result("\ufffdPNG\ufffd"))},
-            {
-                "media_hash_key": "AGgkIbPRTG",
-                "input": self.saved("wrong-key.json", tool_text(chat_xdk.Chat().encrypt_stream(PNG, os.urandom(32)))),
-            },
+            {"media_hash_key": "AGgkIbPRTG", "input": self.saved("wrong-key.json", tool_text(other_key))},
             {"media_hash_key": "AGgkIbPRTG", "input": self.saved("short.json", tool_text(blob, size_bytes=len(blob) + 1))},
             {"media_hash_key": "Unknown1", "input": self.saved("other.json", tool_text(blob))},
         ]
-        result = self.run_media([encrypted_media_message("AGgkIbPRTG")], media, "--out-dir", str(self.tmp))
+        result = self.run_media([event], media, "--out-dir", str(self.tmp))
         self.assertEqual(result["media"], [])
         self.assertEqual(
             result["errors"],
@@ -1240,70 +1281,53 @@ GIF = b"GIF89a" + struct.pack("<HH", 320, 240) + bytes(20)
 
 
 def parts_bytes(item: dict) -> bytes:
-    """The encrypted image an encrypt-media result's part files add up to."""
+    """The encrypted image a session-encrypt media item's part files add up to."""
     return b"".join(base64.b64decode(Path(part["path"]).read_text()) for part in item["parts"])
 
 
-class EncryptMediaTest(unittest.TestCase):
+class PrepareMediaTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
-        self.out = self.tmp / "out"
-        self.key = base64.b64decode(VECTORS["conversation_key"])
 
     def saved(self, name: str, content: bytes) -> str:
         path = self.tmp / name
         path.write_bytes(content)
         return str(path)
 
-    def run_encrypt(self, media: list, *argv: str, signing_keys=(SDK_KEY,), conversation_id="1111:2222") -> dict:
+    def run_prepare(self, media: list, signing_keys=(SDK_KEY,), conversation_id="1111:2222") -> dict:
         stdin = {"conversation_id": conversation_id, **encrypted_thread(list(signing_keys)), "media": media}
-        result = run_cli("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.out), *argv, pin=PIN, stdin=stdin)
+        result = run_cli("--juicebox", "{}", "prepare-media", pin=PIN, stdin=stdin)
         self.assertNotIn(VECTORS["conversation_key"], json.dumps(result))
         return result
 
-    def test_parts_add_up_to_the_image_encrypted_with_the_conversation_key(self):
-        image = png(640, 480, 200_000)
-        result = self.run_encrypt([{"input": self.saved("photo.png", image)}], "--part-bytes", "65536")
+    def test_gives_the_encrypted_size_without_encrypting(self):
+        result = self.run_prepare([{"input": self.saved("photo.png", png(640, 480, 200_000))}])
 
         self.assertEqual(result["errors"], {})
+        self.assertNotIn("upload_dir", result)
         [item] = result["media"]
-        encrypted = parts_bytes(item)
-        self.assertEqual(chat_xdk.Chat().decrypt_stream(encrypted, self.key), image)
         self.assertEqual(
-            {k: v for k, v in item.items() if k not in ("input", "parts")},
+            {k: v for k, v in item.items() if k != "input"},
             {
                 "filename": "photo.png",
                 "mime_type": "image/png",
                 "width": 640,
                 "height": 480,
                 "size_bytes": 200_000,
-                "total_bytes": len(encrypted),
-                "num_parts": 4,
+                "total_bytes": chat_xdk.encrypted_file_size(200_000),
                 "conversation_key_version": "1001",
             },
         )
-        upload_dir = Path(result["upload_dir"])
-        self.assertEqual(upload_dir.parent, self.out)
-        self.assertEqual(stat.S_IMODE(upload_dir.stat().st_mode), 0o700)
-        self.assertEqual([part["segment_index"] for part in item["parts"]], [0, 1, 2, 3])
-        for part in item["parts"]:
-            path = Path(part["path"])
-            self.assertEqual((path.parent, stat.S_IMODE(path.stat().st_mode)), (upload_dir, 0o600))
-            self.assertLessEqual(len(base64.b64decode(path.read_text())), 65536)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["photo.png"])
 
     def test_upload_conversation_id_is_the_colon_form_the_upload_tools_take(self):
         photo = self.saved("photo.png", png(1, 1))
         for conversation_id in ("1111:2222", "2222-1111", "1111"):
             with self.subTest(conversation_id=conversation_id):
-                result = self.run_encrypt([{"input": photo}], conversation_id=conversation_id)
+                result = self.run_prepare([{"input": photo}], conversation_id=conversation_id)
                 self.assertEqual(result["upload_conversation_id"], "1111:2222")
-
-    def test_parts_are_4_mib_by_default(self):
-        [item] = self.run_encrypt([{"input": self.saved("big.png", png(4000, 3000, 4_500_000))}])["media"]
-        sizes = [len(base64.b64decode(Path(part["path"]).read_text())) for part in item["parts"]]
-        self.assertEqual(sizes, [4 * 1024 * 1024, item["total_bytes"] - 4 * 1024 * 1024])
 
     def test_each_file_that_is_not_an_allowed_image_gets_an_error(self):
         media = [
@@ -1316,7 +1340,7 @@ class EncryptMediaTest(unittest.TestCase):
             {"input": self.saved("photo.jpg", JPEG), "filename": "IMG_0001.JPG"},
             {"input": self.saved("wave.gif", GIF)},
         ]
-        result = self.run_encrypt(media)
+        result = self.run_prepare(media)
 
         errors = result["errors"]
         self.assertIn("No such file", errors.pop("4"))
@@ -1334,9 +1358,6 @@ class EncryptMediaTest(unittest.TestCase):
             [(m["filename"], m["mime_type"], m["width"], m["height"]) for m in result["media"]],
             [("IMG_0001.JPG", "image/jpeg", 640, 480), ("wave.gif", "image/gif", 320, 240)],
         )
-        self.assertEqual(
-            sorted(p.name for p in Path(result["upload_dir"]).iterdir()), ["image6-part0.b64", "image7-part0.b64"]
-        )
 
     def test_the_latest_key_change_alone_is_enough(self):
         photo = self.saved("photo.png", png(1, 1))
@@ -1348,24 +1369,144 @@ class EncryptMediaTest(unittest.TestCase):
                     "signing_keys": [SDK_KEY],
                     "media": [{"input": photo}],
                 }
-                result = run_cli("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.out), pin=PIN, stdin=stdin)
+                result = run_cli("--juicebox", "{}", "prepare-media", pin=PIN, stdin=stdin)
                 self.assertEqual((result["errors"], result["media"][0]["conversation_key_version"]), ({}, "1001"))
 
     def test_needs_a_verified_conversation_key(self):
         with self.assertRaises(SystemExit) as raised:
-            self.run_encrypt([{"input": self.saved("photo.png", png(1, 1))}], signing_keys=())
+            self.run_prepare([{"input": self.saved("photo.png", png(1, 1))}], signing_keys=())
 
         self.assertIn("signing_keys", str(raised.exception))
-        self.assertEqual(list(self.out.iterdir()), [])
+
+    def test_encrypt_media_points_to_the_new_flow(self):
+        with self.assertRaises(SystemExit) as raised:
+            run_cli("encrypt-media", "--out-dir", str(self.tmp), stdin={})
+        self.assertIn("prepare-media", str(raised.exception))
 
 
-class EncryptedSizeTest(unittest.TestCase):
-    def test_matches_encrypt_stream(self):
-        key = base64.b64decode(VECTORS["conversation_key"])
-        for size in (0, 1, 1023, 1024, 1025, 2048, 5000):
-            with self.subTest(size=size):
-                encrypted = chat_xdk.Chat().encrypt_stream(bytes(size), key)
-                self.assertEqual(xchat_lite._encrypted_size(size), len(encrypted))
+class FeatureServer:
+    """A local GET /2/chat/features that turns v1_send on for every chat pointed at it."""
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"features":{"v1_send":true}}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/2/chat/features"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def chat_sending_v1() -> chat_xdk.Chat:
+    """A chat for user 2222, as the CLI runs, once it sends v1 (signature version 10).
+
+    While it lives, chats created for the same user share its feature switches and send v1 at once.
+    """
+    chat = vector_chat()
+    chat.set_identity(chat_xdk.SetIdentityParams("2222", "1"))
+    params = chat_xdk.EncryptMessageParams(
+        "1111:2222", "probe", conversation_key=base64.b64decode(VECTORS["conversation_key"]),
+        conversation_key_version="1001",
+    )
+    deadline = time.monotonic() + 10
+    while chat.encrypt_message(params).signature_info.signature_version != "10":
+        if time.monotonic() > deadline:
+            raise AssertionError("the chat never turned v1 on")
+        time.sleep(0.01)
+    return chat
+
+
+def turn_v1_on(test: unittest.TestCase) -> None:
+    """Have the X API's v1_send switch on for the rest of this test, so sends use per-message keys."""
+    server = FeatureServer()
+    test.addCleanup(server.close)
+    chat_xdk._native._feature_set_default_endpoint(server.url)
+    test.addCleanup(chat_xdk._native._feature_set_default_endpoint, OFFLINE_FEATURES)
+    test.v1_chat = chat_sending_v1()
+
+
+def received(fields: dict) -> str:
+    """A session-encrypt result as recipients receive it: sent by 2222 under its message id."""
+    create = base64.b64decode(fields["encoded_message_create_event"])
+    return _message_event(create, "2222", "1111:2222", event_id=fields["message_id"])
+
+
+class V1SendTest(unittest.TestCase):
+    def setUp(self) -> None:
+        turn_v1_on(self)
+
+    def test_message_reply_reaction_and_edit_read_back(self):
+        sent = {
+            "message": session_encrypt(text="hello"),
+            "reply": session_encrypt(text="pong", reply_to="1"),
+            "reaction": session_encrypt(reaction={"target": "1", "emoji": "👍"}),
+            "edit": session_encrypt(text="fixed", edit="1"),
+        }
+        thread = {**encrypted_thread([SDK_KEY]), "events": [VECTORS["message_event"], *map(received, sent.values())]}
+        rows = run_decrypt(thread)["messages"][2:]
+
+        self.assertEqual(texts({"messages": rows}), ["hello", "pong", "reacted 👍 to 1", "edited 1: fixed"])
+        # A v1 edit also names the signed message id it edits, which is not what the text shows.
+        self.assertEqual(rows[3]["event"]["content"]["target_message_id"], "2c2a1d32-988b-4b0e-9e63-c3baab3003fd")
+        self.assertEqual(rows[3]["event"]["content"]["target_message_sequence_id"], "1")
+        for name, fields in sent.items():
+            with self.subTest(name):
+                created, _ = xchat_lite._thrift_value(base64.b64decode(fields["encoded_message_create_event"]), 0, STRUCT)
+                self.assertEqual(created.get(112), 1)
+
+
+class PrepareKeysTest(unittest.TestCase):
+    KEYS = {"identity_public_key": VECTORS["identity_public_key"], "public_key_version": "1"}
+
+    def test_takes_either_key_field_names_and_passes_the_request_fields_through(self):
+        shapes = {
+            "get_users_public_keys names": [
+                {"user_id": "1111", "public_key": VECTORS["identity_public_key"], "public_key_version": "1"},
+                {"user_id": "2222", "public_key": VECTORS["identity_public_key"], "key_version": 1},
+            ],
+            "chat-xdk names": [{"user_id": "1111", **self.KEYS}, {"user_id": "2222", **self.KEYS}],
+        }
+        for shape, public_keys in shapes.items():
+            with self.subTest(shape):
+                body = run_cli("--juicebox", "{}", "prepare-keys", pin=PIN,
+                               stdin={"conversation_id": "1111-2222", "public_keys": public_keys})
+                self.assertEqual(
+                    sorted(body), ["_local_conversation_key_b64", "action_signatures", "conversation_key_version",
+                                   "conversation_participant_keys"],
+                )
+                self.assertEqual(
+                    sorted((k["user_id"], k["public_key_version"]) for k in body["conversation_participant_keys"]),
+                    [("1111", "1"), ("2222", "1")],
+                )
+                [action] = body["action_signatures"]
+                self.assertEqual(
+                    sorted(action["message_event_signature"]),
+                    ["public_key_version", "signature", "signature_version", "signing_public_key"],
+                )
+
+    def test_first_message_goes_with_the_add_conversation_keys_body(self):
+        public_keys = [{"user_id": "1111", **self.KEYS}, {"user_id": "2222", **self.KEYS}]
+        out = run_cli("--juicebox", "{}", "session-encrypt", pin=PIN,
+                      stdin={"conversation_id": "1111-2222", "text": "hi", "prepare": {"public_keys": public_keys}})
+
+        self.assertTrue(out["needs_add_conversation_keys_before_send"])
+        self.assertNotIn("_local_conversation_key_b64", out["add_conversation_keys"])
+        self.assertEqual(len(out["add_conversation_keys"]["conversation_participant_keys"]), 2)
+        self.assertTrue(out["encoded_message_create_event"])
 
 
 class SessionEncryptMediaTest(unittest.TestCase):
@@ -1373,6 +1514,7 @@ class SessionEncryptMediaTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
+        self.out = self.tmp / "out"
         self.photo = self.tmp / "photo.png"
         self.photo.write_bytes(png(640, 480, 5000))
         self.entry = {"media_hash_key": "AGgkIbPRTG", "input": str(self.photo)}
@@ -1383,20 +1525,46 @@ class SessionEncryptMediaTest(unittest.TestCase):
         return str(path)
 
     def test_media_is_sent_as_an_image_attachment(self):
-        fields = session_encrypt(text="look", media=[self.entry])
+        fields = session_encrypt("--out-dir", str(self.out), text="look", media=[self.entry])
         _, (variant, contents) = sent_create(fields)
         [attachment] = contents[3]
 
         self.assertEqual((fields["action"], variant, contents[1]), ("message", 1, b"look"))
         self.assertTrue(fields["message_id"])
+        total_bytes = chat_xdk.encrypted_file_size(5000)
+        sha256 = hashlib.sha256(self.photo.read_bytes()).digest()
         self.assertEqual(
             attachment[1],
-            {1: b"AGgkIbPRTG", 2: {1: 640, 2: 480}, 3: 1, 5: xchat_lite._encrypted_size(5000), 6: b"photo.png"},
+            {1: b"AGgkIbPRTG", 2: {1: 640, 2: 480}, 3: 1, 5: total_bytes, 6: b"photo.png", 11: sha256},
         )
         self.assertEqual(
             xchat_lite._attachment_from_thrift(attachment),
             {"filename": "photo.png", "attachment_type": "Media", "media_type": "image"},
         )
+        [item] = fields["media"]
+        self.assertEqual(
+            {k: v for k, v in item.items() if k != "parts"},
+            {"media_hash_key": "AGgkIbPRTG", "filename": "photo.png", "total_bytes": total_bytes, "num_parts": 1},
+        )
+        self.assertEqual(len(parts_bytes(item)), total_bytes)
+        upload_dir = Path(fields["upload_dir"])
+        self.assertEqual((upload_dir.parent, stat.S_IMODE(upload_dir.stat().st_mode)), (self.out, 0o700))
+        self.assertNotIn(VECTORS["conversation_key"], json.dumps(fields))
+
+    def test_parts_are_4_mib_by_default_or_part_bytes(self):
+        big = {**self.entry, "input": self.saved("big.png", png(4000, 3000, 4_500_000))}
+        [item] = session_encrypt("--out-dir", str(self.out), media=[big])["media"]
+        sizes = [len(base64.b64decode(Path(part["path"]).read_text())) for part in item["parts"]]
+        self.assertEqual(sizes, [4 * 1024 * 1024, item["total_bytes"] - 4 * 1024 * 1024])
+
+        mid = {**self.entry, "input": self.saved("mid.png", png(640, 480, 200_000))}
+        fields = session_encrypt("--out-dir", str(self.out), "--part-bytes", "65536", media=[mid])
+        [item] = fields["media"]
+        self.assertEqual([part["segment_index"] for part in item["parts"]], [0, 1, 2, 3])
+        for part in item["parts"]:
+            path = Path(part["path"])
+            self.assertEqual((str(path.parent), stat.S_IMODE(path.stat().st_mode)), (fields["upload_dir"], 0o600))
+            self.assertLessEqual(len(base64.b64decode(path.read_text())), 65536)
 
     def test_photo_without_a_caption_and_as_a_reply(self):
         photo = session_encrypt(media=[self.entry])
@@ -1409,6 +1577,7 @@ class SessionEncryptMediaTest(unittest.TestCase):
             (reply["action"], reply_contents[1], reply_contents[3][0][1][6], reply_contents[4][6]),
             ("reply", b"here", b"chart.png", b"1"),
         )
+        self.assertEqual([item["filename"] for item in reply["media"]], ["chart.png"])
 
     def test_bad_media_fails(self):
         notes = self.tmp / "notes.txt"
@@ -1423,31 +1592,57 @@ class SessionEncryptMediaTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(SystemExit):
                 session_encrypt(**options)
 
-    def test_media_encrypted_under_another_conversation_key_fails(self):
+    def test_media_prepared_under_another_conversation_key_fails(self):
         with self.assertRaises(SystemExit) as raised:
             session_encrypt(text="look", media=[{**self.entry, "conversation_key_version": "1000"}])
-        self.assertIn("run encrypt-media again", str(raised.exception))
+        self.assertIn("run prepare-media again", str(raised.exception))
 
-    def test_encrypt_media_upload_reads_back_with_decrypt_media(self):
-        image = png(640, 480, 70_000)
-        stdin = {
-            "conversation_id": "1111:2222",
-            **encrypted_thread([SDK_KEY]),
-            "media": [{"input": self.saved("upload.png", image)}],
-        }
-        args = ("--juicebox", "{}", "encrypt-media", "--out-dir", str(self.tmp / "up"), "--part-bytes", "65536")
-        [item] = run_cli(*args, pin=PIN, stdin=stdin)["media"]
-        sent = session_encrypt(text="look", media=[{**item, "media_hash_key": "AGgkIbPRTG"}])
-        event = _message_event(base64.b64decode(sent["encoded_message_create_event"]), "2222", "1111:2222")
+    def send_and_read_back(self, image: bytes) -> tuple[dict, dict, bytes]:
+        """prepare-media, then session-encrypt with its result, as the README's image flow runs them.
+
+        Returns session-encrypt's output, the sent message's create event, and the image read back from
+        the upload parts by decrypt-media.
+        """
+        stdin = {"conversation_id": "1111:2222", **encrypted_thread([SDK_KEY]), "media": [{"input": self.saved("upload.png", image)}]}
+        [item] = run_cli("--juicebox", "{}", "prepare-media", pin=PIN, stdin=stdin)["media"]
+        sent = session_encrypt("--out-dir", str(self.out), "--part-bytes", "65536", text="look",
+                               media=[{**item, "media_hash_key": "AGgkIbPRTG"}])
+        [uploaded] = sent["media"]
+        self.assertEqual(uploaded["total_bytes"], item["total_bytes"])
+        create = base64.b64decode(sent["encoded_message_create_event"])
+        event = _message_event(create, "2222", "1111:2222", event_id=sent["message_id"])
         thread = {"conversation_key_events": [VECTORS["key_change_event"]], "events": [event]}
-
         self.assertEqual(texts(run_decrypt(thread))[-1], "[photo] look")
-        download = self.saved("download.json", json.dumps(tool_text(parts_bytes(item))).encode())
+        download = self.saved("download.json", json.dumps(tool_text(parts_bytes(uploaded))).encode())
         media = [{"media_hash_key": "AGgkIbPRTG", "input": download}]
         result = run_cli("--juicebox", "{}", "decrypt-media", "--out-dir", str(self.tmp / "down"), pin=PIN,
                          stdin={**thread, "media": media})
         self.assertEqual(result["errors"], {})
-        self.assertEqual(Path(result["media"][0]["path"]).read_bytes(), image)
+        created, _ = xchat_lite._thrift_value(create, 0, STRUCT)
+        return sent, created, Path(result["media"][0]["path"]).read_bytes()
+
+    def test_upload_reads_back_with_decrypt_media(self):
+        image = png(640, 480, 70_000)
+        sent, created, read_back = self.send_and_read_back(image)
+
+        self.assertEqual(read_back, image)
+        self.assertNotIn(112, created)
+        self.assertTrue(sent["xdk_version"])
+
+    def test_upload_reads_back_when_the_x_api_turns_v1_on(self):
+        # Under per-message keys (v1) each file's key is derived from its message and attachment,
+        # which is why session-encrypt, not prepare-media, encrypts it.
+        turn_v1_on(self)
+        image = png(640, 480, 70_000)
+        sent, created, read_back = self.send_and_read_back(image)
+
+        self.assertEqual(created.get(112), 1, "the message was not sent with a per-message key")
+        self.assertEqual(read_back, image)
+        key = base64.b64decode(VECTORS["conversation_key"])
+        with self.assertRaises(chat_xdk.DecryptionError):
+            chat_xdk.Chat().decrypt_file_with_key(
+                chat_xdk.DecryptFileWithKeyParams(parts_bytes(sent["media"][0]), key)
+            )
 
 
 if __name__ == "__main__":
