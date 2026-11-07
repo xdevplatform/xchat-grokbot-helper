@@ -181,31 +181,53 @@ def _read_saved_key() -> str | None:
         return None
 
 
-def _forget_saved_key() -> bool:
-    """Delete the saved key from the key file and the OS keyring. True when there was one."""
-    forgotten = False
+def _forget_key_file() -> bool:
     try:
         _key_file().unlink()
-        forgotten = True
+        return True
     except FileNotFoundError:
-        pass
-    backend = _keyring()
-    if backend is not None and backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is not None:
+        return False
+
+
+def _forget_keyring_key(backend: Any) -> bool:
+    if backend is None:
+        return False
+    try:
+        if backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is None:
+            return False
         backend.delete_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME)
-        forgotten = True
-    return forgotten
+        return True
+    except Exception as e:
+        print(f"Could not reach the OS keyring to delete a saved X Chat key ({type(e).__name__}).", file=sys.stderr)
+        return False
+
+
+def _forget_saved_key() -> bool:
+    """Delete the saved key from the key file and the OS keyring. True when there was one."""
+    forgotten = _forget_key_file()
+    return _forget_keyring_key(_keyring()) or forgotten
 
 
 def _write_saved_key(saved: str) -> None:
-    """Store in the OS keyring, or in a mode-600 file in a mode-700 directory when that fails."""
-    _forget_saved_key()
+    """Store in the OS keyring, or in a mode-600 file in a mode-700 directory when that fails.
+
+    The copy in the other place is deleted only once the new key is stored, so a
+    failed save leaves the previous key in place.
+    """
     backend = _keyring()
     if backend is not None:
         try:
             backend.set_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME, saved)
-            return
         except Exception:
             pass
+        else:
+            _forget_key_file()
+            return
+    _write_key_file(saved)
+    _forget_keyring_key(backend)
+
+
+def _write_key_file(saved: str) -> None:
     path = _key_file()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.parent.chmod(0o700)
