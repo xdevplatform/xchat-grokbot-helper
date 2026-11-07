@@ -1083,6 +1083,22 @@ class SavedKeyTest(unittest.TestCase):
             self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": True})
         self.assertEqual(keyring.passwords, {})
 
+    def test_failing_os_keyring_falls_back_to_the_key_file(self):
+        class LockedKeyring(FakeKeyring):
+            def get_password(self, service: str, name: str) -> str | None:
+                raise RuntimeError("keyring is locked")
+
+            def set_password(self, service: str, name: str, password: str) -> None:
+                raise RuntimeError("keyring is locked")
+
+        with mock.patch.object(xchat_lite, "_keyring", LockedKeyring):
+            self.assertTrue(self.remember()["key_saved"])
+            self.assertEqual(stat.S_IMODE(self.key_file.stat().st_mode), 0o600)
+            self.assertEqual(run_cli("unlock-check", chat=NoUnlockChat)["key_source"], "saved")
+            self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": True})
+            self.assertFalse(self.key_file.exists())
+            self.assertEqual(run_cli("forget"), {"ok": True, "forgotten": False})
+
     def test_only_os_keyring_backends_are_used(self):
         def backend(module: str):
             return type("Backend", (), {"__module__": module})()

@@ -190,9 +190,13 @@ def _forget_saved_key() -> bool:
     except FileNotFoundError:
         pass
     backend = _keyring()
-    if backend is not None and backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is not None:
-        backend.delete_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME)
-        forgotten = True
+    if backend is not None:
+        try:
+            if backend.get_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME) is not None:
+                backend.delete_password(_SAVED_KEY_SERVICE, _SAVED_KEY_NAME)
+                forgotten = True
+        except Exception as e:
+            print(f"Could not reach the OS keyring to delete a saved X Chat key ({type(e).__name__}).", file=sys.stderr)
     return forgotten
 
 
