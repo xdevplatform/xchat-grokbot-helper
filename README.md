@@ -22,13 +22,17 @@ python3 -m venv .venv
 
 `chatxdk` is pinned at 0.7.2 (also in `requirements.txt`, which CI installs), which needs Python 3.10 or newer. Rerunning the install line moves an existing venv from 0.5.x; the helper no longer runs on 0.5.x.
 
-`chatxdk` reads the X API's feature switches itself, with an anonymous `GET https://api.x.com/2/chat/features` (no credentials, no user data but the last four digits of the user id as `?bucket=`) on a background thread, again every 5 minutes while the process runs. When the X API turns `v1_send` on, messages, replies, reactions and edits are sent with per-message keys (v1); otherwise, or when that request is blocked, they are sent as before (v0). Apps on `chatxdk` 0.5.x can't read v1 messages.
+`chatxdk` reads the X API's feature switches itself, with an anonymous `GET https://api.x.com/2/chat/features` (no credentials, no user data but the last four digits of the user id as `?bucket=`) on a background thread, again every 5 minutes while the process runs. Once that request has returned `v1_send` on, messages, replies, reactions and edits are sent with per-message keys (v1); until then, or when the request is blocked, they are sent under the conversation key as before (v0).
+
+**This helper's sends usually stay v0, even after X turns `v1_send` on.** Each run is a short-lived CLI process that usually encrypts before chatxdk has fetched the `v1_send` switch. In a test, a run sent v1 only when that request answered within about 20 ms, faster than a real request to `api.x.com` usually is. v0 messages stay valid: apps on `chatxdk` 0.7 read both v0 and v1, and apps on 0.5.x read v0 but can't read v1.
 
 **Upgrading from 0.5.x: `target_message_id` changed meaning, and nothing reports it.** In `decrypt` output, a reaction's, reaction removal's or edit's `event.content.target_message_id` used to hold the sequence id of the message it targets (such as `"2001"`). That sequence id is now in `target_message_sequence_id`. `target_message_id` is now missing on reactions and on most edits; on an edit sent with per-message keys it holds the edited message's `message_id` (a UUID like `2c2a1d32-…`), not its sequence id. Code that keeps reading `target_message_id` gets no error, just `None` or the wrong id, so change it to read `target_message_sequence_id`. Other renamed fields: `key_version` is now `conversation_key_version`, an edit's `new_text` is now `updated_text`, and a delete's `message_ids` is now `sequence_ids`.
 
 Provide a **Chat PIN** via env `CHAT_PIN` (e.g. your host’s secret store). Never echo it into logs or chat.
 
-To skip the PIN on later runs, add `--remember-key` to a PIN unlock. The helper then saves the unlocked private key in the OS keyring when the optional [`keyring`](https://pypi.org/project/keyring/) package finds one, otherwise in `~/.config/xchat-grokbot-helper/saved-key.json` (mode `600`, directory `700`). Anyone with access to this computer account could then read your X Chats. `forget` deletes it.
+To skip the PIN on later runs, add `--remember-key` to a PIN unlock. The helper then saves the unlocked private key, under that run's user id and key version, in the OS keyring when the optional [`keyring`](https://pypi.org/project/keyring/) package finds one, otherwise in `~/.config/xchat-grokbot-helper/saved-key.json` (mode `600`, directory `700`). Anyone with access to this computer account could then read your X Chats. `forget` deletes it.
+
+**Pass `--key-version` (or `XCHAT_KEY_VERSION`) on every run, including the one that saves the key.** Set it to the `public_key_version` that `get_users_public_key` returns. Without it the helper uses `1`. Unless that is your version, a run without it skips a key saved under your real version and asks for the PIN again, and a key saved without it signs messages that recipients can't verify.
 
 Tests (no network or PIN needed): `.venv/bin/python -m unittest`
 
@@ -59,13 +63,15 @@ SCRIPT=./xchat_lite.py
 
 # common flags
 #   --user-id           numeric X user id
-#   --key-version       public_key_version
+#   --key-version       public_key_version from get_users_public_key; pass it on every run
+#                       (the default, 1, skips a key saved under your real version)
 #   --juicebox          path to juicebox_config JSON (or inline JSON)
 
 $PY $SCRIPT --user-id "$UID" --key-version "$VER" --juicebox ./juicebox.json unlock-check
 # stdout includes key_source (saved | pin) and key_saved
 
-# unlock with the PIN and save the key; later runs need neither the PIN nor --juicebox
+# unlock with the PIN and save the key; later runs need neither the PIN nor --juicebox,
+# but do need the same --user-id and --key-version
 $PY $SCRIPT --user-id "$UID" --key-version "$VER" --juicebox ./juicebox.json --remember-key unlock-check
 
 # delete the saved key
@@ -199,7 +205,7 @@ JSON
 
 ## Typical agent / app flow
 
-1. Unlock once per session (`unlock-check`). A saved key is used when it matches the user id and key version; otherwise the PIN unlocks Juicebox.
+1. Unlock once per session (`unlock-check`). A saved key is used when it matches the run's `--user-id` and `--key-version`; otherwise the PIN unlocks Juicebox.
 2. List conversations → fetch every events page → fetch every sender's signing keys → `decrypt` → show the text.
    For a photo or video: take the attachment's `media_hash_key` from the decrypted message → MCP `chat_media_download` → save the result to a file → `decrypt-media` → open the file it writes.
 3. Owner approves outbound text → `session-encrypt` → POST ciphertext via MCP/API (`send_chat_message`).
