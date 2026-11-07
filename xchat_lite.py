@@ -1704,9 +1704,8 @@ def cmd_prepare_media(args: argparse.Namespace) -> None:
 
 def cmd_encrypt_media(args: argparse.Namespace) -> None:
     raise SystemExit(
-        "encrypt-media is gone: chatxdk 0.7 encrypts an image from the message that carries it. Run "
-        "prepare-media, chat_media_upload_initialize, then session-encrypt with media, which writes the "
-        "upload parts; append them, finalize, and send. See \"Send an image\" in the README."
+        "encrypt-media was removed with chatxdk 0.7: run prepare-media, then session-encrypt with the media "
+        "field (see \"Send an image\" in the README)"
     )
 
 
@@ -1835,7 +1834,8 @@ def main() -> None:
         "prepare-media",
         help="Check images and give chat_media_upload_initialize's total_bytes",
     )
-    p_old_upload = sub.add_parser("encrypt-media", help="Replaced by prepare-media and session-encrypt's media")
+    # Hidden: kept so callers of the removed command get a message instead of "invalid choice".
+    p_old_upload = sub.add_parser("encrypt-media")
     p_old_upload.add_argument("--out-dir", default="")
     p_old_upload.add_argument("--part-bytes", default="")
     p_enc = sub.add_parser(
@@ -1856,6 +1856,7 @@ def main() -> None:
     )
     p_session.add_argument("--out-dir", default="", help="Where media upload parts go")
     p_session.add_argument("--part-bytes", type=_part_bytes, default=_MAX_PART_BYTES)
+    sub.metavar = "{" + ",".join(name for name in sub.choices if name != "encrypt-media") + "}"
 
     args = parser.parse_args()
     if args.cmd == "unlock-check":

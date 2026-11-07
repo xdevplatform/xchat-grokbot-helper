@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -1415,10 +1416,20 @@ class PrepareMediaTest(unittest.TestCase):
 
         self.assertIn("signing_keys", str(raised.exception))
 
-    def test_encrypt_media_points_to_the_new_flow(self):
-        with self.assertRaises(SystemExit) as raised:
-            run_cli("encrypt-media", "--out-dir", str(self.tmp), stdin={})
-        self.assertIn("prepare-media", str(raised.exception))
+    def test_encrypt_media_is_hidden_and_exits_with_one_line(self):
+        def script(*argv: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, xchat_lite.__file__, *argv], input="{}", capture_output=True, text=True, timeout=60
+            )
+
+        removed = script("--user-id", "2222", "encrypt-media", "--out-dir", str(self.tmp), "--part-bytes", "65536")
+        self.assertEqual(removed.returncode, 1)
+        self.assertEqual(removed.stdout, "")
+        [line] = removed.stderr.splitlines()
+        self.assertIn("removed with chatxdk 0.7", line)
+        self.assertIn("prepare-media", line)
+        self.assertIn("session-encrypt", line)
+        self.assertNotIn("encrypt-media", script("--help").stdout)
 
 
 class FeatureServer:

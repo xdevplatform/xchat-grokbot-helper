@@ -24,6 +24,8 @@ python3 -m venv .venv
 
 `chatxdk` reads the X API's feature switches itself, with an anonymous `GET https://api.x.com/2/chat/features` (no credentials, no user data but the last four digits of the user id as `?bucket=`) on a background thread, again every 5 minutes while the process runs. When the X API turns `v1_send` on, messages, replies, reactions and edits are sent with per-message keys (v1); otherwise, or when that request is blocked, they are sent as before (v0). Apps on `chatxdk` 0.5.x can't read v1 messages.
 
+**Upgrading from 0.5.x: `target_message_id` changed meaning, and nothing reports it.** In `decrypt` output, a reaction's, reaction removal's or edit's `event.content.target_message_id` used to hold the sequence id of the message it targets (such as `"2001"`). That sequence id is now in `target_message_sequence_id`. `target_message_id` is now missing on reactions and on most edits; on an edit sent with per-message keys it holds the edited message's `message_id` (a UUID like `2c2a1d32-…`), not its sequence id. Code that keeps reading `target_message_id` gets no error, just `None` or the wrong id, so change it to read `target_message_sequence_id`. Other renamed fields: `key_version` is now `conversation_key_version`, an edit's `new_text` is now `updated_text`, and a delete's `message_ids` is now `sequence_ids`.
+
 Provide a **Chat PIN** via env `CHAT_PIN` (e.g. your host’s secret store). Never echo it into logs or chat.
 
 To skip the PIN on later runs, add `--remember-key` to a PIN unlock. The helper then saves the unlocked private key in the OS keyring when the optional [`keyring`](https://pypi.org/project/keyring/) package finds one, otherwise in `~/.config/xchat-grokbot-helper/saved-key.json` (mode `600`, directory `700`). Anyone with access to this computer account could then read your X Chats. `forget` deletes it.
@@ -88,7 +90,7 @@ JSON
 # stdout: messages[] (one per event, each with display text and status verified | unencrypted | unverified),
 #         unverified_senders, skipped_signing_keys, errors, conversation_keys
 # each message's event carries chatxdk 0.7's field names: conversation_key_version, and for reactions
-# and edits target_message_sequence_id (a v1 edit's target_message_id is the edited message's message id),
+# and edits target_message_sequence_id (not target_message_id, which changed meaning: see Install),
 # updated_text, and sequence_ids for deletes
 # a member removal's re-encryption of the group title or description, which chatxdk drops, gets a row
 # with empty text and skipped (the reason) instead of an error
