@@ -1,1 +1,1 @@
-chatxdk==0.7.2
+chatxdk==0.7.3
