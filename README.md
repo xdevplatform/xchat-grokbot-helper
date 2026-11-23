@@ -16,13 +16,13 @@ System events keep empty `text` and add a `notice`, such as `[added 333, 444]`, 
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -U pip "chatxdk==0.7.3"
+.venv/bin/pip install -U pip "chatxdk==0.7.6"
 # place xchat_lite.py in this directory (or anywhere on PATH with the venv python)
 ```
 
-`chatxdk` is pinned at 0.7.3 (also in `requirements.txt`, which CI installs), which needs Python 3.10 or newer. Rerunning the install line moves an existing venv from 0.5.x; the helper no longer runs on 0.5.x.
+`chatxdk` is pinned at 0.7.6 (also in `requirements.txt`, which CI installs), which needs Python 3.10 or newer. Rerunning the install line moves an existing venv from 0.5.x; the helper no longer runs on 0.5.x.
 
-`chatxdk` reads the X API's feature switches itself, with an anonymous `GET https://api.x.com/2/chat/features` (no credentials, no user data but the last four digits of the user id as `?bucket=`) on a background thread, again every 5 minutes while the process runs. Once that request has returned `v1_send` on, messages, replies, reactions and edits are sent with per-message keys (v1); until then, or when the request is blocked, they are sent under the conversation key as before (v0).
+`chatxdk` reads the X API's feature switches itself, with an anonymous `GET https://api.x.com/2/chat/features` (no credentials, no user data but the last four digits of the user id as `?bucket=`) on a background thread, again every 5 minutes while the process runs. Once that request has returned `v1_send` on, messages, replies, reactions and edits are sent with per-message keys (v1); until then, or when the request is blocked, they are sent under the conversation key as before (v0). The request goes through the `http://` proxy that `HTTPS_PROXY` (else `ALL_PROXY`) names unless `NO_PROXY` exempts `api.x.com`, and `CHAT_XDK_API_BASE_URL` (such as `https://api.example.com`) sends it to another host in place of `https://api.x.com`.
 
 **This helper's sends usually stay v0, even after X turns `v1_send` on.** Each run is a short-lived CLI process that usually encrypts before chatxdk has fetched the `v1_send` switch. In a test, a run sent v1 only when that request answered within about 20 ms, faster than a real request to `api.x.com` usually is. v0 messages stay valid: apps on `chatxdk` 0.7 read both v0 and v1, and apps on 0.5.x read v0 but can't read v1.
 
